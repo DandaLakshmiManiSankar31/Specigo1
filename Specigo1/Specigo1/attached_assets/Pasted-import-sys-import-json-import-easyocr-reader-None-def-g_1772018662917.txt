@@ -1,0 +1,78 @@
+import sys
+import json
+import easyocr
+
+reader = None
+
+def get_reader():
+    global reader
+    if reader is None:
+        reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+    return reader
+
+def process_image(image_path):
+    r = get_reader()
+    results = r.readtext(image_path, detail=1, paragraph=False)
+
+    if not results:
+        return ""
+
+    # Get max x for column gap calculation
+    all_x_ends = [bbox[2][0] for (bbox, _, _) in results]
+    max_x = max(all_x_ends) if all_x_ends else 1000
+
+    # Dynamic row grouping threshold based on average text height
+    all_heights = [(bbox[2][1] - bbox[0][1]) for (bbox, _, _) in results]
+    avg_height = sum(all_heights) / len(all_heights) if all_heights else 20
+    threshold = max(avg_height * 1.2, 20)
+
+    # Group text blocks into rows using dynamic threshold
+    lines = {}
+    for (bbox, text, conf) in results:
+        top_left = bbox[0]
+        y_center = (bbox[0][1] + bbox[2][1]) / 2
+        line_key = round(y_center / threshold) * threshold
+
+        if line_key not in lines:
+            lines[line_key] = []
+        lines[line_key].append({
+            'x': top_left[0],
+            'x_end': bbox[2][0],
+            'text': text,
+            'conf': conf
+        })
+
+    sorted_lines = sorted(lines.keys())
+    output_lines = []
+
+    for lk in sorted_lines:
+        words = sorted(lines[lk], key=lambda w: w['x'])
+
+        line_parts = []
+        for i, word in enumerate(words):
+            if i == 0:
+                line_parts.append(word['text'])
+            else:
+                gap = word['x'] - words[i - 1]['x_end']
+                # If gap is large, treat as a new column
+                if gap > max_x * 0.05:
+                    line_parts.append('    |    ' + word['text'])
+                else:
+                    line_parts.append(word['text'])
+
+        output_lines.append(' '.join(line_parts))
+
+    return '\n'.join(output_lines)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "No image path provided"}))
+        sys.exit(1)
+
+    image_path = sys.argv[1]
+    try:
+        text = process_image(image_path)
+        print(json.dumps({"text": text, "success": True}))
+    except Exception as e:
+        print(json.dumps({"error": str(e), "success": False}))

@@ -1,0 +1,359 @@
+Q 3. Where do you live ? (Personal History)
+ANS – Type here
+
+Q 4. What’s your occupation? (Lifestyle)
+ANS -  TYPE HERE 
+                  OR 
+           CHOOSE FROM BELOW 
+
+Primary Occupational Categories
+•	1. Professional/Administrative -> Healthcare workers (doctors, nurses, technicians)
+
+•	Healthcare workers (doctors, nurses, technicians)
+•	Teachers .educators, Scientists.
+•	Legal professionals
+•	Business executives and managers
+•	Administrative staff
+2. Technical/Skilled Trades
+•	Engineers and technicians
+•	Electricians, plumbers, mechanics
+•	Construction workers
+•	Welders and metalworkers
+•	Computer/IT professionals
+3. Service Industry
+•	Food service workers
+•	Retail employees
+•	Transportation workers
+•	Security personnel
+•	Cleaning and maintenance staff
+4. Industrial/Manufacturing
+•	Factory workers
+•	Chemical plant workers
+•	Textile workers
+•	Assembly line workers
+•	Quality control inspectors
+5. Agricultural/Environmental
+•	Farmers and agricultural workers
+•	Forestry workers
+•	Mining personnel
+•	Environmental workers
+•	Landscaping professionals
+6. Public Safety (Lifesytle)
+•	Police officers
+•	Firefighters
+•	Emergency medical services
+•	Military personnel
+•	Corrections officers
+
+Q 5. What’s your educational qualification ? (Personal History)
+
+      A) No formal education
+       B) School level (up to 10th)
+       C) Higher secondary (12th)
+       D)  Diploma
+       E)  Graduate - BA, BSc, BCom BBA, BCA MBBS, BDS, BPharm
+       F)   Postgraduate - MA, MSc, MCom MBA, MCA   MSc , MD, MS
+       G) Doctorate
+       H)  Add Other –
+
+
+Q 6.  What’s Your Socio Economic Status ? (Lifestyle)
+
+          Socio Economic Status-
+1)	Upper class
+2)	Upper middle class
+3)	Lower middle class
+4)	Upper lower class
+5)	Lower class
+
+Addiction history
+
+(Please answer honestly. Your answers help doctors understand your test results better.)
+
+Q1. Have you ever used any habit-forming substances? (Lifestyle)
+
+
+(Substances that people can get addicted to)
+
+☐ No, never
+
+☐ Yes, in the past but stopped now
+
+☐ Yes, I am currently using
+
+Q2. Which substance(s) have you used or are using? (Lifestyle)
+
+(You can choose more than one)
+
+Tobacco (products made from tobacco):
+
+☐ Cigarettes / bidi
+
+☐ Chewing tobacco / gutkha / khaini
+
+Alcohol (drinks containing alcohol):
+
+☐ Beer
+
+☐ Wine
+
+☐ Whisky / rum / brandy
+
+Drugs / Medicines:
+
+☐ Painkillers taken without prescription (opioids)
+
+☐ Sleeping or anxiety pills (sedatives)
+
+☐ Ganja / marijuana / charas (cannabis)
+
+☐ Cocaine / other energy-boosting drugs (stimulants)
+
+☐ Glue / whitener / thinner (inhalants)
+
+☐ Muscle-building injections or tablets (steroids)
+
+☐ Other (please mention): __________
+
+Q3. At what age did you start using this substance? (Lifestyle)
+
+Age: ______ years
+
+Q4. For how many years have you used this substance? (Lifestyle)
+
+______ years
+
+Q5. How often do you use it? (Lifestyle)
+
+☐ Every day
+
+☐ A few times a week
+
+☐ Occasionally (once in a while)
+
+☐ Only in large amounts at one time (binge use)
+
+Q6. How much do you usually take? (Lifestyle)
+
+If tobacco:
+
+Number of cigarettes/bidis per day: ______
+
+If alcohol:
+
+Number of drinks per day: ______
+
+If other substances:
+
+Approximate amount per use: ______
+
+Q7. How do you take the substance? (Lifestyle)
+
+(Route of use – how it enters your body)
+
+☐ By mouth (drinking or swallowing)
+
+☐ Smoking
+
+☐ Injection (needle)
+
+☐ Sniffing through nose
+
+Q8. When was the last time you used it? (Lifestyle)
+
+Date: __________
+
+Or: ______ days ago
+
+Q9. Do you feel a strong urge or need to use the substance? (Lifestyle)
+
+(Craving – strong desire to use)
+
+☐ Yes
+
+☐ No
+
+Q10. Do you need to take more amount now to get the same effect? (Lifestyle)
+
+(Tolerance – body needing higher dose)
+
+☐ Yes
+
+☐ No
+
+Q11. Have you tried to stop but were unable to? (Lifestyle)
+
+(Loss of control)
+
+☐ Yes
+
+☐ No
+
+Q12. Do you continue using even though it affects your health, family, or work? (Lifestyle)
+
+☐ Yes
+
+☐ No
+
+Q13. Do you feel unwell when you stop using the substance? (Lifestyle)
+
+(Withdrawal symptoms – discomfort after stopping)
+
+☐ No symptoms
+
+☐ Mild symptoms
+
+☐ Severe symptoms
+
+Q14. If yes, what problems do you experience when you stop? (Lifestyle)
+
+(You may select more than one)
+
+☐ Shaking of hands (tremors)
+
+☐ Excess sweating
+
+☐ Anxiety or restlessness
+
+☐ Trouble sleeping (insomnia)
+
+☐ Fits (seizures)
+
+☐ Confusion or seeing things
+
+Q15. Have you ever taken treatment to stop this habit? (Lifestyle)
+
+☐ No
+
+☐ Yes, medicines or hospital admission (detox treatment)
+
+☐ Counseling or rehabilitation center
+
+☐ Started again after stopping (relapse)
+
+Q17. Would you like help or guidance to reduce or stop this habit? (Lifestyle)
+
+☐ Yes
+
+☐ No
+
+☐ Maybe later
+
+Q18. Any additional information you would like to share? (Optional) (Lifestyle)
+
+occupation history
+
+(Your work may affect your health and blood test results. Please answer honestly.)
+________________________________________
+Q1. Are you currently working? (Lifestyle)
+•	☐ Yes
+•	☐ No
+•	☐ Retired
+•	☐ Student
+•	☐ Homemaker
+________________________________________
+Q2. What is your current occupation? (Lifestyle)
+(Type of work you do)
+•	Job / work title: _______________________
+________________________________________
+Q3. What type of work do you mainly do? (Lifestyle)
+•	☐ Office / desk work (sitting most of the time)
+•	☐ Physical / manual work (lifting, walking, standing)
+•	☐ Skilled technical work (machine operation, repair)
+•	☐ Healthcare work (hospital, lab, nursing)
+•	☐ Agriculture / farming
+•	☐ Industrial / factory work
+•	☐ Business / shop work
+•	☐ Unemployed currently
+________________________________________
+Q4. How many years have you been doing this work? (Lifestyle)
+•	______ years
+________________________________________
+Q5. How many hours do you work per day on average? (Lifestyle)
+•	☐ Less than 6 hours
+•	☐ 6–8 hours
+•	☐ More than 8 hours
+________________________________________
+Q6. Do you work in shifts? (Lifestyle)
+(Shift work – working at different times like night duty)
+•	☐ No
+•	☐ Yes, rotating shifts
+•	☐ Yes, night shifts
+________________________________________
+Q7. Does your work involve exposure to any harmful substances? (Lifestyle)
+(Exposure – contact with harmful materials)
+•	☐ No
+•	☐ Yes
+If yes, please select:
+•	☐ Dust (cement, coal, silica)
+•	☐ Chemicals (acids, solvents, pesticides)
+•	☐ Fumes or gases (smoke, welding fumes)
+•	☐ Heavy metals (lead, mercury, arsenic)
+•	☐ Biological materials (blood, body fluids)
+•	☐ Radiation (X-ray, nuclear, radiology work)
+•	☐ Loud noise (machines, factories)
+________________________________________
+Q8. Do you use protective equipment at work? (Lifestyle)
+(Protective equipment – safety items used during work)
+•	☐ Yes, regularly (mask, gloves, helmet, goggles)
+•	☐ Sometimes
+•	☐ No
+________________________________________
+Q9. Does your work involve heavy physical activity? (Lifestyle)
+(Physical strain – heavy body effort)
+•	☐ No
+•	☐ Mild (walking, light lifting)
+•	☐ Moderate (regular lifting, long standing)
+•	☐ Heavy (very hard physical labor)
+________________________________________
+Q10. Does your job cause mental stress? (Lifestyle)
+(Mental stress – tension, pressure, anxiety due to work)
+•	☐ No
+•	☐ Mild
+•	☐ Moderate
+•	☐ Severe
+________________________________________
+Q11. Do you have any health problems related to your work? (Lifestyle)
+(Work-related illness)
+•	☐ Back pain / joint pain
+•	☐ Breathing problems (asthma, cough)
+•	☐ Skin problems (rashes, itching)
+•	☐ Hearing problems
+•	☐ Vision problems
+•	☐ Frequent infections
+•	☐ None
+________________________________________
+Q12. Have you ever changed or stopped a job due to health issues? (Lifestyle)
+•	☐ No
+•	☐ Yes
+If yes, please specify briefly:
+__________________________________________
+________________________________________
+Q13. Previous Occupation (if different from current) (Lifestyle)
+•	Previous job title: _______________________
+•	Number of years worked: ______ years
+________________________________________
+Q14. Did your previous job involve exposure to harmful substances? (Lifestyle)
+•	☐ No
+•	☐ Yes
+If yes, please mention:
+__________________________________________
+________________________________________
+Q15. Are you currently exposed to work-related risks? (Lifestyle)
+(Risk – chance of health problems due to work)
+•	☐ No
+•	☐ Yes
+•	☐ Not sure
+________________________________________
+Q16. Does your occupation affect your ability to attend medical follow-ups or tests? (Lifestyle)
+•	☐ No
+•	☐ Yes, due to work timing
+•	☐ Yes, due to travel or shift duties
+________________________________________
+Q17. Would you like advice on reducing health risks related to your work? (Lifestyle)
+•	☐ Yes
+•	☐ No
+•	☐ Maybe later
+________________________________________
+Q18. Any additional information about your work you want to share? (Optional) (Lifestyle)
+
