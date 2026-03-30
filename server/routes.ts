@@ -1,0 +1,3392 @@
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import { api } from "@shared/routes";
+import { z } from "zod";
+import {
+  insertUserSchema,
+  insertRecordSchema,
+  insertReportSchema,
+} from "@shared/schema";
+import multer from "multer";
+import { PDFParse } from "pdf-parse";
+import Tesseract from "tesseract.js";
+import { execSync } from "child_process";
+import fs from "fs";
+import path from "path";
+import os from "os";
+
+async function morphologicalClean(inputPath: string, outputDir: string): Promise<Buffer[]> {
+  const { execSync } = await import("child_process");
+  const results: Buffer[] = [];
+  const configs = [
+    { name: "morph_open_3x1", cmd: `-colorspace Gray -threshold 60% -negate -morphology Open "3x1: 1,1,1" -negate` },
+    { name: "morph_open_1x3", cmd: `-colorspace Gray -threshold 60% -negate -morphology Open "1x3: 1 1 1" -negate` },
+    { name: "morph_open_sq3", cmd: `-colorspace Gray -threshold 60% -negate -morphology Open Square:3 -negate` },
+    { name: "morph_cca", cmd: `-colorspace Gray -threshold 50% -negate -morphology Open Rectangle:4x1 -morphology Close Rectangle:1x3 -negate` },
+  ];
+  for (const cfg of configs) {
+    try {
+      const outFile = path.join(outputDir, `${cfg.name}.png`);
+      execSync(
+        `magick "${inputPath}" ${cfg.cmd} "${outFile}"`,
+        { timeout: 15000, stdio: "pipe" }
+      );
+      if (fs.existsSync(outFile)) {
+        results.push(fs.readFileSync(outFile));
+        console.log(`[Morpho] Created variant: ${cfg.name}`);
+      }
+    } catch (err: any) {
+      console.error(`[Morpho] ${cfg.name} failed:`, err?.message?.substring(0, 100) || err);
+    }
+  }
+  return results;
+}
+
+async function preprocessImageForOCR(buffer: Buffer): Promise<Buffer[]> {
+  const sharp = (await import("sharp")).default;
+  const metadata = await sharp(buffer).metadata();
+  const width = metadata.width || 0;
+
+  const targetWidth = Math.max(3000, width * 2);
+
+  const variant1 = await sharp(buffer)
+    .resize({
+      width: targetWidth,
+      kernel: sharp.kernel.lanczos3,
+      withoutEnlargement: false,
+    })
+    .grayscale()
+    .normalize()
+    .sharpen({ sigma: 1.0 })
+    .png()
+    .toBuffer();
+
+  const variant2 = await sharp(buffer)
+    .resize({
+      width: targetWidth,
+      kernel: sharp.kernel.lanczos3,
+      withoutEnlargement: false,
+    })
+    .grayscale()
+    .normalize()
+    .sharpen({ sigma: 2.0, m1: 2.0, m2: 1.0 })
+    .linear(1.3, -30)
+    .png()
+    .toBuffer();
+
+  const resizedForMorpho = await sharp(buffer)
+    .resize({
+      width: targetWidth,
+      kernel: sharp.kernel.lanczos3,
+      withoutEnlargement: false,
+    })
+    .grayscale()
+    .normalize()
+    .png()
+    .toBuffer();
+
+  const allVariants: Buffer[] = [variant1, variant2];
+  const morphoDir = fs.mkdtempSync(path.join(os.tmpdir(), "morpho-"));
+  try {
+    const morphoIn = path.join(morphoDir, "input.png");
+    fs.writeFileSync(morphoIn, resizedForMorpho);
+    const morphoVariants = await morphologicalClean(morphoIn, morphoDir);
+    if (morphoVariants.length > 0) {
+      allVariants.push(...morphoVariants);
+    } else {
+      const fallback = await sharp(resizedForMorpho)
+        .threshold(180)
+        .median(3)
+        .png()
+        .toBuffer();
+      allVariants.push(fallback);
+      console.log("[Morpho] Fallback to threshold+median variant");
+    }
+  } finally {
+    try { fs.rmSync(morphoDir, { recursive: true, force: true }); } catch {}
+  }
+
+  console.log(`[OCR] Total preprocessing variants: ${allVariants.length}`);
+  return allVariants;
+}
+
+function postProcessMedicalOCR(text: string): string {
+  let result = text;
+
+  result = result.replace(/[↓↑→←▼▲►◄⬆⬇⬅➡↗↘↙↖]/g, "");
+
+  result = result.replace(
+    /(\b\d{1,4}(?:\.\d+)?)\s+(\d{1,4}(?:\.\d+)?)\b/g,
+    (match: string, num1: string, num2: string) => {
+      const v1 = parseFloat(num1);
+      const v2 = parseFloat(num2);
+      if (v1 < v2 && v2 <= v1 * 20 && v1 > 0) {
+        return `${num1}-${num2}`;
+      }
+      return match;
+    }
+  );
+
+  result = result.replace(
+    /([^a-zA-Z0-9])[|!¡\[]\s*(\d{1,4}(?:\.\d+)?)\s*(mg\/d[lL]|g\/d[lL]|IU\/L|U\/L|mmol\/L|µmol\/L|ng\/mL|pg\/mL|mEq\/L|%|lakhs|million|cumm)/gi,
+    "$1$2 $3"
+  );
+
+  result = result.replace(
+    /(PLATELET\s+COUNT\s+)(\d{2,3})(\s+lakhs)/gi,
+    (match: string, prefix: string, value: string, suffix: string) => {
+      const num = parseInt(value);
+      if (num >= 10 && num <= 999) {
+        const corrected = (num / 10).toFixed(1);
+        return `${prefix}${corrected}${suffix}`;
+      }
+      return match;
+    },
+  );
+
+  result = result.replace(
+    /(PLATELET\s+COUNT\s+[\d.]+\s+lakhs\/cumm\s+)(\d{2})\s*[-–]\s*(\d{2})/gi,
+    (match: string, prefix: string, lower: string, upper: string) => {
+      const l = parseInt(lower);
+      const u = parseInt(upper);
+      if (l >= 10 && u >= 10) {
+        return `${prefix}${(l / 10).toFixed(1)}-${(u / 10).toFixed(1)}`;
+      }
+      return match;
+    },
+  );
+
+  result = result.replace(
+    /(TOTAL\s+RBC\s+COUNT\s+[\d.]+\s+million\/cumm\s+)(\d{2})\s*[-–]\s*(\d{2})/gi,
+    (match: string, prefix: string, lower: string, upper: string) => {
+      const l = parseInt(lower);
+      const u = parseInt(upper);
+      if (l >= 10 && u >= 10) {
+        return `${prefix}${(l / 10).toFixed(1)}-${(u / 10).toFixed(1)}`;
+      }
+      return match;
+    },
+  );
+
+  const knownRangeCorrections: Array<{ pattern: RegExp; refRange: string }> = [
+    {
+      pattern:
+        /(MCHC|MEAN\s+CELL\s+HAEMOGLOBIN\s*CON[A-Z]*)[^0-9]*(?:H\s+)?[\d.]+\s*%\s+(\d{3})\s*[-–]\s*(\d{3})/gi,
+      refRange: "",
+    },
+    {
+      pattern:
+        /(MCV|MEAN\s+CORPUSCULAR\s+VOLUME)[^0-9]*[\d.]+\s*[if]L\s+(\d{3})\s*[-–]\s*(\d{3})/gi,
+      refRange: "",
+    },
+    {
+      pattern:
+        /(MCH|MEAN\s+CELL\s+HAEMOGLOBIN)\b(?!\s*CON)[^0-9]*[\d.]+\s*Pg\s+(\d{2})\s*[-–]\s*(\d{2})/gi,
+      refRange: "",
+    },
+  ];
+
+  for (const { pattern } of knownRangeCorrections) {
+    result = result.replace(pattern, (match: string, ...args: string[]) => {
+      const groups = args.filter(
+        (a) => typeof a === "string" && /^\d+$/.test(a),
+      );
+      if (groups.length >= 2) {
+        const lower = parseInt(groups[groups.length - 2]);
+        const upper = parseInt(groups[groups.length - 1]);
+        if (lower >= 100 && upper >= 100 && lower < upper) {
+          const cl = (lower / 10).toFixed(1);
+          const cu = (upper / 10).toFixed(1);
+          return match.replace(`${lower}`, cl).replace(`${upper}`, cu);
+        }
+        if (
+          lower >= 10 &&
+          lower <= 99 &&
+          upper >= 10 &&
+          upper <= 99 &&
+          lower < upper
+        ) {
+          return match;
+        }
+      }
+      return match;
+    });
+  }
+
+  result = result.replace(
+    /(\b(?:MCHC|MEAN\s+CELL\s+HAEMOGLOBIN\s*CON\w*)\b.*?)(\b315\b)(.*?[-–].*?)(\b345\b)/gi,
+    (match: string, p1: string, v1: string, mid: string, v2: string) =>
+      `${p1}31.5${mid}34.5`,
+  );
+
+  result = result.replace(
+    /(\b(?:MCV|MEAN\s+CORPUSCULAR\s+VOLUME)\b.*?)(\b830\b)(.*?[-–].*?)(\b1010\b)/gi,
+    (match: string, p1: string, v1: string, mid: string, v2: string) =>
+      `${p1}83.0${mid}101.0`,
+  );
+
+  return result;
+}
+
+function scoreOcrQuality(text: string): number {
+  let score = 0;
+  const decimalNumbers = text.match(/\d+\.\d+/g);
+  score += (decimalNumbers?.length || 0) * 10;
+  const dashRanges = text.match(/\d+[\.\d]*\s*[-–]\s*\d+[\.\d]*/g);
+  score += (dashRanges?.length || 0) * 8;
+  const medicalTerms = text.match(
+    /\b(HEMOGLOBIN|PLATELET|LEUKOCYTE|NEUTROPHIL|LYMPHOCYTE|EOSINOPHIL|MONOCYTE|BASOPHIL|HEMATOCRIT|MCV|MCH|MCHC|RBC|WBC|CBC|mg\/dl|g\/dl|IU\/L|cumm|lakhs|million|pg\/ml|ng\/mL|mmol|µmol)/gi,
+  );
+  score += (medicalTerms?.length || 0) * 5;
+  const garbled = text.match(
+    /[^a-zA-Z0-9\s.,;:()\/\-–%<>&'"!?@#$*+=\[\]{}|\\~`^_\n\r\t]/g,
+  );
+  score -= (garbled?.length || 0) * 2;
+  const alphanumRatio =
+    (text.match(/[a-zA-Z0-9]/g)?.length || 0) / Math.max(text.length, 1);
+  score += Math.round(alphanumRatio * 50);
+  return score;
+}
+
+async function removeArrowsFromImage(
+  imgBuffer: Buffer,
+  worker: Tesseract.Worker,
+  tmpDir: string
+): Promise<Buffer | null> {
+  const sharp = (await import("sharp")).default;
+  const tmpFile = path.join(tmpDir, "arrow-detect.png");
+  fs.writeFileSync(tmpFile, imgBuffer);
+
+  const { data } = await worker.recognize(tmpFile);
+  const arrowRegions: Array<{ x: number; y: number; w: number; h: number }> = [];
+
+  if (data.blocks) {
+    for (const block of data.blocks) {
+      for (const para of block.paragraphs || []) {
+        for (const line of para.lines || []) {
+          const words = line.words || [];
+          for (let wi = 0; wi < words.length; wi++) {
+            const word = words[wi];
+            const symbols = word.symbols || [];
+            if (symbols.length < 2) continue;
+
+            const firstSym = symbols[0];
+            const secondSym = symbols[1];
+            if (!firstSym?.bbox || !secondSym?.bbox) continue;
+
+            const firstWidth = firstSym.bbox.x1 - firstSym.bbox.x0;
+            const firstHeight = firstSym.bbox.y1 - firstSym.bbox.y0;
+            const secondWidth = secondSym.bbox.x1 - secondSym.bbox.x0;
+
+            const isFirstNarrow = firstWidth < secondWidth * 0.6;
+            const isFirstTall = firstHeight > firstWidth * 1.5;
+            const isFirstLowConf = (firstSym.confidence || 100) < 70;
+            const isFirstArrowLike = /[1|!¡lI\[\]↓↑▼▲tT]/.test(firstSym.text);
+            const restIsNumber = symbols.slice(1).every((s: any) => /[\d.,]/.test(s.text));
+
+            if (restIsNumber && isFirstArrowLike && (isFirstNarrow || isFirstLowConf || isFirstTall)) {
+              const padding = 2;
+              arrowRegions.push({
+                x: Math.max(0, firstSym.bbox.x0 - padding),
+                y: Math.max(0, firstSym.bbox.y0 - padding),
+                w: (firstSym.bbox.x1 - firstSym.bbox.x0) + padding * 2,
+                h: (firstSym.bbox.y1 - firstSym.bbox.y0) + padding * 2,
+              });
+              console.log(
+                `[Arrow Detect] Found arrow-like char "${firstSym.text}" (conf=${firstSym.confidence?.toFixed(0)}, w=${firstWidth}, h=${firstHeight}) before "${word.text.substring(1)}" at (${firstSym.bbox.x0},${firstSym.bbox.y0})`
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (arrowRegions.length === 0) return null;
+
+  console.log(`[Arrow Detect] Removing ${arrowRegions.length} arrow region(s) from image`);
+
+  const metadata = await sharp(imgBuffer).metadata();
+  const imgWidth = metadata.width || 1;
+  const imgHeight = metadata.height || 1;
+
+  const whitePatches = arrowRegions.map((r) => ({
+    input: Buffer.from(
+      `<svg width="${r.w}" height="${r.h}"><rect x="0" y="0" width="${r.w}" height="${r.h}" fill="white"/></svg>`
+    ),
+    left: Math.min(r.x, imgWidth - 1),
+    top: Math.min(r.y, imgHeight - 1),
+  }));
+
+  const cleaned = await sharp(imgBuffer)
+    .composite(whitePatches)
+    .png()
+    .toBuffer();
+
+  return cleaned;
+}
+
+async function ocrWithEasyOCR(imagePath: string): Promise<string | null> {
+  try {
+    const { execSync } = await import("child_process");
+    const scriptPath = path.join(process.cwd(), "script", "easyocr_process.py");
+    const isWindows = process.platform === "win32";
+    const pythonCmd = isWindows ? "python" : "python3";
+    const result = execSync(
+      `${pythonCmd} "${scriptPath}" "${imagePath}"`,
+      { timeout: 120000, stdio: ["pipe", "pipe", "pipe"], maxBuffer: 10 * 1024 * 1024 }
+    );
+    const output = JSON.parse(result.toString().trim());
+    if (output.success && output.text) {
+      console.log(`[EasyOCR] Success: text length=${output.text.length}`);
+      return output.text;
+    }
+    console.error("[EasyOCR] Failed:", output.error);
+    return null;
+  } catch (err: any) {
+    console.error("[EasyOCR] Error:", err?.message?.substring(0, 200) || err);
+    return null;
+  }
+}
+
+async function ocrWithTesseract(buffer: Buffer, tmpDir: string): Promise<string> {
+  let worker: Tesseract.Worker | null = null;
+  try {
+    const variants = await preprocessImageForOCR(buffer);
+    worker = await Tesseract.createWorker("eng");
+    await worker.setParameters({
+      tessedit_pageseg_mode: Tesseract.PSM.AUTO,
+      preserve_interword_spaces: "1",
+    });
+
+    let bestText = "";
+    let bestScore = -Infinity;
+
+    for (let i = 0; i < variants.length; i++) {
+      const tmpFile = path.join(tmpDir, `variant-${i}.png`);
+      fs.writeFileSync(tmpFile, variants[i]);
+      const {
+        data: { text, confidence },
+      } = await worker.recognize(tmpFile);
+      const rawText = text?.trim() || "";
+      const qualityScore = scoreOcrQuality(rawText) + (confidence || 0);
+      console.log(
+        `[Tesseract] Variant ${i}: confidence=${confidence?.toFixed(1)}, quality=${qualityScore}, len=${rawText.length}`,
+      );
+      if (qualityScore > bestScore) {
+        bestScore = qualityScore;
+        bestText = rawText;
+      }
+    }
+
+    console.log(`[Tesseract] Best score: ${bestScore}`);
+    return bestText;
+  } finally {
+    if (worker) {
+      try { await worker.terminate(); } catch {}
+    }
+  }
+}
+
+async function ocrFromImageBuffer(buffer: Buffer): Promise<string> {
+  if (!buffer || buffer.length < 100) {
+    console.log("[OCR] Image buffer too small, skipping");
+    return "";
+  }
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "medvoice-img-ocr-"));
+  try {
+    const sharp = (await import("sharp")).default;
+    const metadata = await sharp(buffer).metadata();
+    const width = metadata.width || 0;
+    const targetWidth = Math.max(3000, width * 2);
+
+    const preprocessed = await sharp(buffer)
+      .resize({ width: targetWidth, kernel: sharp.kernel.lanczos3, withoutEnlargement: false })
+      .grayscale()
+      .normalize()
+      .sharpen({ sigma: 1.0 })
+      .png()
+      .toBuffer();
+
+    const imgPath = path.join(tmpDir, "input.png");
+    fs.writeFileSync(imgPath, preprocessed);
+
+    console.log("[OCR] Trying EasyOCR (deep learning) first...");
+    const easyOcrText = await ocrWithEasyOCR(imgPath);
+
+    if (easyOcrText && easyOcrText.length > 20) {
+      const easyScore = scoreOcrQuality(easyOcrText);
+      console.log(`[OCR] EasyOCR quality score: ${easyScore}, len: ${easyOcrText.length}`);
+
+      console.log("[OCR] Running Tesseract for comparison...");
+      const tessText = await ocrWithTesseract(buffer, tmpDir);
+      const tessScore = scoreOcrQuality(tessText);
+      console.log(`[OCR] Tesseract quality score: ${tessScore}, len: ${tessText.length}`);
+
+      if (easyScore >= tessScore * 0.7) {
+        console.log("[OCR] Using EasyOCR result (primary)");
+        return postProcessMedicalOCR(easyOcrText);
+      } else {
+        console.log("[OCR] Tesseract scored much better, using Tesseract result");
+        return postProcessMedicalOCR(tessText);
+      }
+    }
+
+    console.log("[OCR] EasyOCR failed or insufficient, falling back to Tesseract");
+    const tessText = await ocrWithTesseract(buffer, tmpDir);
+    return postProcessMedicalOCR(tessText);
+  } catch (err: any) {
+    console.error("[OCR] Error:", err?.message || err);
+    return "";
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+async function ocrFromScannedPdf(buffer: Buffer): Promise<string> {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "medvoice-ocr-"));
+  try {
+    const pdfPath = path.join(tmpDir, "input.pdf");
+    fs.writeFileSync(pdfPath, buffer);
+
+    const outputPrefix = path.join(tmpDir, "page");
+    execSync(`pdftoppm -png -r 300 "${pdfPath}" "${outputPrefix}"`, {
+      timeout: 30000,
+    });
+
+    const pageFiles = fs
+      .readdirSync(tmpDir)
+      .filter((f) => f.startsWith("page") && f.endsWith(".png"))
+      .sort();
+
+    if (pageFiles.length === 0) {
+      console.error("[OCR] No pages generated from PDF");
+      return "";
+    }
+
+    console.log(`[OCR] Converting ${pageFiles.length} PDF page(s) to text...`);
+    const texts: string[] = [];
+    for (const pageFile of pageFiles) {
+      const imgBuffer = fs.readFileSync(path.join(tmpDir, pageFile));
+      const pageText = await ocrFromImageBuffer(imgBuffer);
+      if (pageText) texts.push(pageText);
+    }
+
+    return texts.join("\n\n");
+  } catch (err) {
+    console.error("[OCR] Scanned PDF processing error:", err);
+    return "";
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
+// Configure multer for file uploads
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB max
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = [
+      "application/pdf",
+      "text/plain",
+      "image/png",
+      "image/jpeg",
+    ];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(
+        new Error(
+          "Invalid file type. Only PDF, TXT, PNG, and JPEG are allowed.",
+        ),
+      );
+    }
+  },
+});
+
+// In-memory session storage: userId -> sessionId
+const medgemmaSessions: Map<string, string> = new Map();
+
+const METADATA_KEYWORDS = /^(department\s*name|patient\s*(details|name)|age|ward\s*number|bed\s*number|date|time|gender|sex|sample\s*(type|id|collected)|lab\s*(no|number|id)|report\s*(id|no|number|date)|hospital|doctor|referred\s*by|collected\s*(on|at|date)|received\s*(on|at|date)|reported\s*(on|at|date)|registration|uhid|mr\s*no|op\s*no|ip\s*no|specimen|barcode|accession)/i;
+
+function correctTableStatuses(text: string): string {
+  const lines = text.split("\n");
+  const corrected = lines.filter((line) => {
+    if (!line.includes("|")) return true;
+    const cells = line.split("|").map((c) => c.trim());
+    if (cells.length < 6) return true;
+
+    const paramCell = cells[1];
+    if (!paramCell) return true;
+    if (/parameter|value|range|status/i.test(paramCell)) return true;
+    if (paramCell.includes("---")) return true;
+
+    if (METADATA_KEYWORDS.test(paramCell)) {
+      return false;
+    }
+
+    const rangeCell = cells[3];
+    const statusCell = cells[4];
+    if (rangeCell && statusCell && /^n\/?a$/i.test(rangeCell.replace(/[*_\s]/g, "")) && /^n\/?a$/i.test(statusCell.replace(/[*_\s]/g, ""))) {
+      return false;
+    }
+
+    return true;
+  }).map((line) => {
+    if (!line.includes("|")) return line;
+    const cells = line.split("|").map((c) => c.trim());
+    if (cells.length < 6) return line;
+
+    const valueCell = cells[2];
+    const rangeCell = cells[3];
+    const statusCell = cells[4];
+
+    if (!valueCell || !rangeCell || !statusCell) return line;
+    if (/parameter|value|range|status/i.test(valueCell)) return line;
+    if (statusCell.includes("---")) return line;
+
+    const valueMatch = valueCell.match(/([\d.]+)/);
+    const rangeMatch = rangeCell.match(/([\d.]+)\s*[-–—]\s*([\d.]+)/);
+    const geMatch = rangeCell.match(/>=\s*([\d.]+)/);
+    const leMatch = rangeCell.match(/<=?\s*([\d.]+)/);
+
+    if (!valueMatch) return line;
+    if (!rangeMatch && !geMatch && !leMatch) return line;
+
+    const val = parseFloat(valueMatch[1]);
+
+    let correctStatus = "";
+    let correctExplanation = "";
+
+    if (rangeMatch) {
+      const lower = parseFloat(rangeMatch[1]);
+      const upper = parseFloat(rangeMatch[2]);
+      if (isNaN(val) || isNaN(lower) || isNaN(upper)) return line;
+      if (val < lower) {
+        correctStatus = "Low";
+        correctExplanation = "Below normal limits.";
+      } else if (val > upper) {
+        correctStatus = "Elevated";
+        correctExplanation = "Above upper limit.";
+      } else {
+        correctStatus = "Normal";
+        correctExplanation = "Within normal limits.";
+      }
+    } else if (geMatch) {
+      const threshold = parseFloat(geMatch[1]);
+      if (isNaN(val) || isNaN(threshold)) return line;
+      if (val < threshold) {
+        correctStatus = "Low";
+        correctExplanation = "Below normal limits.";
+      } else {
+        correctStatus = "Normal";
+        correctExplanation = "Within normal limits.";
+      }
+    } else if (leMatch) {
+      const threshold = parseFloat(leMatch[1]);
+      if (isNaN(val) || isNaN(threshold)) return line;
+      if (val > threshold) {
+        correctStatus = "Elevated";
+        correctExplanation = "Above upper limit.";
+      } else {
+        correctStatus = "Normal";
+        correctExplanation = "Within normal limits.";
+      }
+    }
+
+    if (!correctStatus) return line;
+
+    const currentStatusLower = statusCell.toLowerCase().replace(/[*_]/g, "");
+    const isCurrentlyNormal = currentStatusLower === "normal";
+    const isCorrectlyNormal = correctStatus === "Normal";
+
+    // Check if the explanation contradicts the correct status
+    const explanationCell = (cells[5] || "").toLowerCase();
+    const explanationContradictsLow =
+      correctStatus === "Low" &&
+      /\b(high|elevated|elevat|excess|hyperc|hyper|increas|above)/i.test(explanationCell);
+    const explanationContradictsHigh =
+      (correctStatus === "High" || correctStatus === "Elevated") &&
+      /\b(low|decreas|deficien|insufficien|hypoc|hypo|below)/i.test(explanationCell);
+
+    if (isCurrentlyNormal !== isCorrectlyNormal || explanationContradictsLow || explanationContradictsHigh) {
+      const newCells = [...cells];
+      newCells[4] = ` ${correctStatus} `;
+      newCells[5] = ` ${correctExplanation} `;
+      return newCells.join("|");
+    }
+
+    return line;
+  });
+  return corrected.join("\n");
+}
+
+function filterHallucinatedParams(analysisText: string, reportText: string): string {
+  if (!reportText) return analysisText;
+  const reportLower = reportText.toLowerCase().replace(/[_\-\s()]+/g, "");
+
+  const lines = analysisText.split("\n");
+  const result = lines.filter((line) => {
+    if (!line.includes("|")) return true;
+    const cells = line.split("|").map((c) => c.trim());
+    if (cells.length < 6) return true;
+
+    const paramCell = cells[1];
+    if (!paramCell) return true;
+    if (/parameter|value|range|status/i.test(paramCell)) return true;
+    if (paramCell.includes("---")) return true;
+
+    const valueCell = cells[2] || "";
+    const rangeCell = cells[3] || "";
+    if (/^\s*N\/?A\s*$/i.test(valueCell.replace(/\*+/g, '')) && /^\s*N\/?A\s*$/i.test(rangeCell.replace(/\*+/g, '').replace(/not\s+specified.*/i, 'N/A'))) {
+      console.log(`[Report Filter] Removing parameter with N/A value and range: "${paramCell}"`);
+      return false;
+    }
+    if (/not\s+specified|not\s+available|no\s+value/i.test(valueCell) && /not\s+specified|not\s+available/i.test(rangeCell)) {
+      console.log(`[Report Filter] Removing parameter with no value/range: "${paramCell}"`);
+      return false;
+    }
+
+    const paramNormalized = paramCell.toLowerCase().replace(/[_\-\s*\\()]+/g, "");
+    if (paramNormalized.length < 2) return true;
+
+    if (reportLower.includes(paramNormalized)) return true;
+
+    const medicalSpellingVariants: Record<string, string[]> = {
+      'hemoglobin': ['haemoglobin'],
+      'haemoglobin': ['hemoglobin'],
+      'hba1c': ['hba1c', 'glycosylatedhaemoglobin', 'glycosylatedhemoglobin'],
+      'glycosylatedhemoglobin': ['glycosylatedhaemoglobin'],
+      'glycosylatedhaemoglobin': ['glycosylatedhemoglobin'],
+      'estrogen': ['oestrogen'],
+      'oestrogen': ['estrogen'],
+      'fiber': ['fibre'],
+      'fibre': ['fiber'],
+      'fetal': ['foetal'],
+      'foetal': ['fetal'],
+      'leukocyte': ['leucocyte'],
+      'leucocyte': ['leukocyte'],
+    };
+
+    let paramWithVariants = paramNormalized;
+    for (const [original, replacements] of Object.entries(medicalSpellingVariants)) {
+      if (paramNormalized.includes(original)) {
+        for (const replacement of replacements) {
+          const variant = paramNormalized.replace(original, replacement);
+          if (reportLower.includes(variant)) return true;
+        }
+      }
+    }
+
+    const singular = paramNormalized.replace(/s$/, "");
+    const plural = singular + "s";
+
+    const paramVariants = [
+      paramNormalized,
+      singular,
+      plural,
+      paramNormalized.replace(/total$/, "t"),
+      paramNormalized.replace(/direct$/, "d"),
+      paramNormalized.replace(/t$/, "total"),
+      paramNormalized.replace(/d$/, "direct"),
+    ];
+    for (const variant of paramVariants) {
+      if (reportLower.includes(variant)) return true;
+    }
+
+    const words = paramCell.replace(/[_*()]/g, " ").trim().split(/\s+/).filter(w => w.length > 1);
+    if (words.length > 1) {
+      const wordVariants = words.map(w => {
+        const wl = w.toLowerCase();
+        for (const [orig, repls] of Object.entries(medicalSpellingVariants)) {
+          if (wl === orig) return [wl, ...repls];
+        }
+        return [wl];
+      });
+      const allWordsFound = wordVariants.every(variants =>
+        variants.some(v => reportLower.includes(v))
+      );
+      if (allWordsFound) return true;
+    }
+
+    console.log(`[Report Filter] Removing hallucinated parameter: "${paramCell}" — not found in report text`);
+    return false;
+  });
+
+  return result.join("\n");
+}
+
+interface ParsedParamForCorrection {
+  name: string;
+  status: string;
+  matchedTier?: string;
+}
+
+interface ParsedParamForValueRangeSync {
+  name: string;
+  rawValue: string;
+  rawRange: string;
+}
+
+function correctTableStatusesWithClassification(
+  text: string,
+  classifiedParams: ParsedParamForCorrection[]
+): string {
+  if (!classifiedParams.length) return text;
+
+  const lines = text.split("\n");
+  const corrected = lines.map((line) => {
+    if (!line.includes("|")) return line;
+    const cells = line.split("|").map((c) => c.trim());
+    if (cells.length < 6) return line;
+
+    const paramCell = cells[1];
+    if (!paramCell) return line;
+    if (/parameter|value|range|status/i.test(paramCell)) return line;
+    if (paramCell.includes("---")) return line;
+
+    const statusCell = cells[4];
+    if (!statusCell) return line;
+
+    const paramNorm = paramCell.replace(/[*_\s]+/g, ' ').trim().toLowerCase();
+
+    let matched: ParsedParamForCorrection | undefined;
+
+    for (const p of classifiedParams) {
+      const pNorm = p.name.replace(/[*_\s]+/g, ' ').trim().toLowerCase();
+      if (paramNorm === pNorm) {
+        matched = p;
+        break;
+      }
+    }
+
+    if (!matched) {
+      let bestMatch: ParsedParamForCorrection | undefined;
+      let bestScore = 0;
+      for (const p of classifiedParams) {
+        const pNorm = p.name.replace(/[*_\s]+/g, ' ').trim().toLowerCase();
+        const paramWords = paramNorm.replace(/[^a-z0-9\s]/g, '').split(/\s+/);
+        const pWords = pNorm.replace(/[^a-z0-9\s]/g, '').split(/\s+/);
+        const overlap = paramWords.filter(w => pWords.includes(w)).length;
+
+        const lenDiff = Math.abs(paramNorm.length - pNorm.length);
+        const score = overlap * 100 - lenDiff;
+
+        const isLipidPair =
+          (paramNorm.includes("ldl") && pNorm.includes("ldl")) ||
+          (paramNorm.includes("vldl") && pNorm.includes("vldl")) ||
+          (paramNorm.includes("hdl") && pNorm.includes("hdl"));
+
+        if (paramNorm.includes(pNorm) || pNorm.includes(paramNorm)) {
+          if (score > bestScore) {
+            bestScore = score;
+            bestMatch = p;
+          }
+        } else if ((overlap >= Math.min(paramWords.length, pWords.length) && overlap >= 1) ||
+            (isLipidPair && overlap >= 1)) {
+          if (score > bestScore) {
+            bestScore = score;
+            bestMatch = p;
+          }
+        }
+      }
+      matched = bestMatch;
+    }
+
+    if (!matched) return line;
+
+    const currentStatus = statusCell.replace(/[*_]/g, '').trim().toLowerCase();
+    const correctStatus = matched.status;
+
+    const statusMap: Record<string, string[]> = {
+      'Low': ['low', 'deficient', 'severely deficient', 'critically low'],
+      'High': ['high', 'elevated', 'critically high', 'abnormal'],
+      'Normal': ['normal', 'within normal', 'adequate', 'optimal', 'sufficient', 'sufficiency'],
+    };
+
+    const isAlreadyCorrect = (statusMap[correctStatus] || []).some(s => currentStatus.includes(s));
+    if (isAlreadyCorrect) return line;
+
+    const newCells = [...cells];
+    if (correctStatus === 'Low') {
+      newCells[4] = ' Low ';
+    } else if (correctStatus === 'High') {
+      newCells[4] = ' Elevated ';
+    } else {
+      newCells[4] = ' Normal ';
+    }
+
+    console.log(`[StatusFix] ${paramCell}: "${statusCell}" → "${newCells[4].trim()}" (pre-classified: ${correctStatus})`);
+    return newCells.join("|");
+  });
+
+  return corrected.join("\n");
+}
+
+function syncTableValuesAndRangesWithClassification(
+  text: string,
+  classifiedParams: ParsedParamForValueRangeSync[],
+): string {
+  if (!classifiedParams.length) return text;
+
+  const lines = text.split("\n");
+  const corrected = lines.map((line) => {
+    if (!line.includes("|")) return line;
+    const cells = line.split("|");
+    if (cells.length < 6) return line;
+
+    const paramCell = cells[1].trim();
+    if (!paramCell) return line;
+    if (/parameter|value|range|status/i.test(paramCell)) return line;
+    if (paramCell.includes("---")) return line;
+
+    const paramNorm = paramCell.replace(/[*_\s]+/g, " ").trim().toLowerCase();
+
+    let matched: ParsedParamForValueRangeSync | undefined;
+
+    for (const p of classifiedParams) {
+      const pNorm = p.name.replace(/[*_\s]+/g, " ").trim().toLowerCase();
+      if (paramNorm === pNorm) {
+        matched = p;
+        break;
+      }
+    }
+
+    if (!matched) {
+      let bestMatch: ParsedParamForValueRangeSync | undefined;
+      let bestScore = 0;
+      for (const p of classifiedParams) {
+        const pNorm = p.name.replace(/[*_\s]+/g, " ").trim().toLowerCase();
+        const paramWords = paramNorm.replace(/[^a-z0-9\s]/g, "").split(/\s+/);
+        const pWords = pNorm.replace(/[^a-z0-9\s]/g, "").split(/\s+/);
+        const overlap = paramWords.filter((w) => pWords.includes(w)).length;
+        const lenDiff = Math.abs(paramNorm.length - pNorm.length);
+        const score = overlap * 100 - lenDiff;
+
+        if (paramNorm.includes(pNorm) || pNorm.includes(paramNorm)) {
+          if (score > bestScore) { bestScore = score; bestMatch = p; }
+        } else if (overlap >= Math.min(paramWords.length, pWords.length) && overlap >= 1) {
+          if (score > bestScore) { bestScore = score; bestMatch = p; }
+        }
+      }
+      matched = bestMatch;
+    }
+
+    if (!matched) return line;
+
+    const newCells = [...cells];
+    newCells[2] = ` ${matched.rawValue} `;
+    newCells[3] = ` ${matched.rawRange} `;
+
+    return newCells.join("|");
+  });
+
+  return corrected.join("\n");
+}
+
+function deduplicateTableRows(text: string, classifiedParams: ParsedParamForCorrection[]): string {
+  const lines = text.split("\n");
+
+  const dataRows: Array<{line: string; paramKey: string; rangeCell: string; idx: number}> = [];
+  const nonDataLines: Array<{line: string; idx: number}> = [];
+
+  lines.forEach((line, idx) => {
+    if (!line.includes("|")) { nonDataLines.push({line, idx}); return; }
+    const cells = line.split("|").map(c => c.trim());
+    if (cells.length < 6) { nonDataLines.push({line, idx}); return; }
+    const paramCell = cells[1];
+    if (!paramCell || /parameter|value|range|status/i.test(paramCell) || paramCell.includes("---")) {
+      nonDataLines.push({line, idx}); return;
+    }
+    const paramKey = paramCell.replace(/[*_\s]+/g, ' ').trim().toLowerCase();
+    if (paramKey.length < 2) { nonDataLines.push({line, idx}); return; }
+    dataRows.push({line, paramKey, rangeCell: cells[3] || '', idx});
+  });
+
+  const grouped = new Map<string, typeof dataRows>();
+  for (const row of dataRows) {
+    const existing = grouped.get(row.paramKey) || [];
+    existing.push(row);
+    grouped.set(row.paramKey, existing);
+  }
+
+  const keptIndices = new Set<number>();
+  for (const [paramKey, rows] of grouped) {
+    if (rows.length === 1) {
+      keptIndices.add(rows[0].idx);
+      continue;
+    }
+
+    const cp = classifiedParams.find(p => {
+      const pNorm = p.name.replace(/[*_\s]+/g, ' ').trim().toLowerCase();
+      return paramKey === pNorm || paramKey.includes(pNorm) || pNorm.includes(paramKey);
+    });
+
+    if (cp && 'rawRange' in cp) {
+      const rawRange = ((cp as any).rawRange || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      let bestIdx = -1;
+      let bestScore = -1;
+
+      for (const row of rows) {
+        const rc = row.rangeCell.toLowerCase().replace(/\s+/g, ' ').trim();
+        if (rc === rawRange) { bestIdx = row.idx; bestScore = 100; break; }
+
+        const rawWords = rawRange.replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 1);
+        const rcWords = rc.replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 1);
+        const overlap = rawWords.filter(w => rcWords.includes(w)).length;
+        if (overlap > bestScore) { bestScore = overlap; bestIdx = row.idx; }
+      }
+
+      if (bestIdx >= 0) {
+        keptIndices.add(bestIdx);
+        const kept = rows.find(r => r.idx === bestIdx);
+        const removed = rows.filter(r => r.idx !== bestIdx);
+        removed.forEach(r => console.log(`[Dedup] Removed duplicate "${r.rangeCell}", kept "${kept?.rangeCell}" for: "${paramKey}"`));
+        continue;
+      }
+    }
+
+    keptIndices.add(rows[0].idx);
+    rows.slice(1).forEach(r => console.log(`[Dedup] Removed duplicate row for: "${paramKey}"`));
+  }
+
+  for (const nd of nonDataLines) keptIndices.add(nd.idx);
+
+  return lines.filter((_, idx) => keptIndices.has(idx)).join("\n");
+}
+
+function correctTextSectionsWithClassification(
+  text: string,
+  classifiedParams: ParsedParamForCorrection[]
+): string {
+  const wrongStatusesForNormal = ["elevated", "high", "low", "deficient", "critically high", "critically low", "abnormal", "severely deficient"];
+
+  const tierNames = ["deficiency", "insufficiency", "sufficiency", "deficient", "insufficient", "sufficient", "severely deficient", "non-diabetic", "pre-diabetes", "at risk", "impaired glucose", "diabetes mellitus", "diagnosing diabetes", "hypoglycemia", "borderline"];
+
+  const lines = text.split("\n");
+  const correctedLines = lines.map((line) => {
+    if (line.includes("|")) return line;
+
+    let corrected = line;
+
+    for (const p of classifiedParams) {
+      const paramName = p.name.replace(/\\/g, "");
+      const paramNameEscaped = paramName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const correctStatus = p.status;
+
+      if (correctStatus === "Normal") {
+        corrected = corrected.replace(
+          new RegExp(`(${paramNameEscaped})\\s*\\((${wrongStatusesForNormal.join("|")})\\)`, "gi"),
+          `${paramName} (Normal)`
+        );
+        corrected = corrected.replace(
+          new RegExp(`(Elevated|High|Low|Deficient|Abnormal)\\s+(${paramNameEscaped})(?=\\s*[:\\.,;]|\\s*$)`, "gi"),
+          `Normal ${paramName}`
+        );
+      } else if (correctStatus === "High") {
+        corrected = corrected.replace(
+          new RegExp(`(${paramNameEscaped})\\s*\\((Normal|Low|Deficient)\\)`, "gi"),
+          `${paramName} (High)`
+        );
+        corrected = corrected.replace(
+          new RegExp(`(Normal|Low|Deficient)\\s+(${paramNameEscaped})(?=\\s*[:\\.,;]|\\s*$)`, "gi"),
+          `Elevated ${paramName}`
+        );
+      } else if (correctStatus === "Low") {
+        corrected = corrected.replace(
+          new RegExp(`(${paramNameEscaped})\\s*\\((Normal|High|Elevated)\\)`, "gi"),
+          `${paramName} (Low)`
+        );
+        corrected = corrected.replace(
+          new RegExp(`(Normal|High|Elevated)\\s+(${paramNameEscaped})(?=\\s*[:\\.,;]|\\s*$)`, "gi"),
+          `Low ${paramName}`
+        );
+      }
+
+      if (p.matchedTier) {
+        const correctTier = p.matchedTier.toLowerCase();
+        const wrongTiers = tierNames.filter(t => t !== correctTier);
+        
+        const paramLineMatch = new RegExp(paramNameEscaped, "i").test(corrected);
+        if (paramLineMatch && wrongTiers.length > 0) {
+          for (const wrongTier of wrongTiers) {
+            const escaped = wrongTier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const patterns = [
+              new RegExp(`(indicates\\s+(?:\\w+\\s+){0,3}?)${escaped}\\b`, "gi"),
+              new RegExp(`(falls\\s+within\\s+the\\s+)${escaped}\\b`, "gi"),
+              new RegExp(`(within\\s+the\\s+)${escaped}\\b`, "gi"),
+              new RegExp(`(in\\s+the\\s+)${escaped}\\b`, "gi"),
+              new RegExp(`(is\\s+)${escaped}\\b`, "gi"),
+              new RegExp(`(classified\\s+as\\s+)${escaped}\\b`, "gi"),
+              new RegExp(`(shows\\s+)${escaped}\\b`, "gi"),
+              new RegExp(`(suggests?\\s+)${escaped}\\b`, "gi"),
+              new RegExp(`\\b${escaped}(\\s+range\\s+of)`, "gi"),
+              new RegExp(`\\b${escaped}(\\s+range\\s*\\()`, "gi"),
+              new RegExp(`\\b${escaped}(\\s+level)`, "gi"),
+            ];
+            for (const pat of patterns) {
+              if (pat.test(corrected)) {
+                const before = corrected;
+                corrected = corrected.replace(pat, (match, group1) => {
+                  if (match.startsWith(wrongTier) || match.startsWith(wrongTier.charAt(0).toUpperCase() + wrongTier.slice(1))) {
+                    return correctTier.charAt(0).toUpperCase() + correctTier.slice(1) + group1;
+                  }
+                  return group1 + correctTier;
+                });
+                if (corrected !== before) {
+                  console.log(`[TierCorrection] Fixed "${wrongTier}" → "${correctTier}" for ${paramName}`);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return corrected;
+  });
+
+  return correctedLines.join("\n");
+}
+
+export async function registerRoutes(
+  httpServer: Server,
+  app: Express,
+): Promise<Server> {
+  // User Routes
+  app.post(api.users.login.path, async (req, res) => {
+    try {
+      const { phoneNumber } = api.users.login.input.parse(req.body);
+      let user = await storage.getUserByPhone(phoneNumber);
+
+      if (!user) {
+        // Create new user if not exists - but name will be null initially
+        user = await storage.createUser({ phoneNumber });
+        res.status(201).json(user);
+      } else {
+        // Existing user found
+        res.status(200).json(user);
+      }
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        res.status(400).json({ message: err.errors[0].message });
+        return;
+      }
+      console.error("[Login Error]", err);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.patch(api.users.update.path.replace(":id", ":id"), async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const updates = api.users.update.input.parse(req.body);
+      const user = await storage.updateUser(id, updates);
+      res.json(user);
+    } catch (err) {
+      res.status(400).json({ message: "Invalid update data" });
+    }
+  });
+
+  app.get(api.users.listByPhone.path, async (req, res) => {
+    const allUsers = await storage.getUsersByPhone(req.params.phoneNumber);
+    res.json(allUsers);
+  });
+
+  app.get(api.users.getById.path, async (req, res) => {
+    const user = await storage.getUser(parseInt(req.params.id));
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.json(user);
+  });
+
+  app.get(api.users.get.path, async (req, res) => {
+    const user = await storage.getUserByPhone(req.params.phoneNumber);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.json(user);
+  });
+
+  app.post(api.users.createFamilyMember.path, async (req, res) => {
+    try {
+      const { phoneNumber, name, age, gender, bloodGroup, height, weight, place, occupation, qualification, parentUserId } = api.users.createFamilyMember.input.parse(req.body);
+      const newUser = await storage.createUser({
+        phoneNumber,
+        name,
+        age: age || null,
+        gender: gender || null,
+        bloodGroup: bloodGroup || null,
+        height: height || null,
+        weight: weight || null,
+        place: place || null,
+        occupation: occupation || null,
+        qualification: qualification || null,
+        isPrimary: 0,
+        parentUserId,
+      });
+      res.status(201).json(newUser);
+    } catch (err) {
+      res.status(400).json({ message: "Could not create family member" });
+    }
+  });
+
+  // Medical Records Routes
+  app.post(api.records.create.path, async (req, res) => {
+    try {
+      const record = insertRecordSchema.parse(req.body);
+      const saved = await storage.createMedicalRecord(record);
+      res.status(201).json(saved);
+    } catch (err) {
+      res.status(400).json({ message: "Invalid record data" });
+    }
+  });
+
+  app.get(api.records.list.path, async (req, res) => {
+    const userId = parseInt(req.params.userId);
+    const records = await storage.getMedicalRecords(userId);
+    res.json(records);
+  });
+
+  app.delete(
+    api.records.delete.path.replace(":id", ":id"),
+    async (req, res) => {
+      try {
+        const id = parseInt(req.params.id);
+        await storage.deleteMedicalRecord(id);
+        res.json({ success: true });
+      } catch (err) {
+        res.status(500).json({ message: "Failed to delete record" });
+      }
+    },
+  );
+
+  app.delete(
+    api.records.deleteByDate.path
+      .replace(":userId", ":userId")
+      .replace(":date", ":date"),
+    async (req, res) => {
+      try {
+        const userId = parseInt(req.params.userId);
+        const date = req.params.date;
+        await storage.deleteMedicalRecordsByDate(userId, date);
+        res.json({ success: true });
+      } catch (err) {
+        res.status(500).json({ message: "Failed to delete records for date" });
+      }
+    },
+  );
+
+  // Translation Route - Using Google Translate API (free tier)
+  // Text-to-Speech proxy for Telugu/Hindi (Google Translate TTS)
+  app.get("/api/tts", async (req, res) => {
+    try {
+      const { text, lang } = req.query;
+
+      if (!text || !lang) {
+        return res
+          .status(400)
+          .json({ message: "Missing text or lang parameter" });
+      }
+
+      const encodedText = encodeURIComponent(text as string);
+      const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=${lang}&client=tw-ob&q=${encodedText}`;
+
+      const response = await fetch(ttsUrl, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+          Referer: "https://translate.google.com/",
+        },
+      });
+
+      if (!response.ok) {
+        console.error(
+          "[TTS Proxy] Google TTS returned error:",
+          response.status,
+        );
+        return res.status(500).json({ message: "TTS service error" });
+      }
+
+      const audioBuffer = await response.arrayBuffer();
+
+      res.set({
+        "Content-Type": "audio/mpeg",
+        "Content-Length": audioBuffer.byteLength,
+        "Cache-Control": "public, max-age=86400",
+      });
+
+      res.send(Buffer.from(audioBuffer));
+    } catch (err) {
+      console.error("[TTS Proxy] Error:", err);
+      res.status(500).json({ message: "TTS proxy error" });
+    }
+  });
+
+  app.post("/api/translate", async (req, res) => {
+    try {
+      const { text, fromLang, toLang } = req.body;
+
+      if (!text || !fromLang || !toLang) {
+        return res.status(400).json({ message: "Missing required fields" });
+      }
+
+      if (fromLang === toLang) {
+        return res.json({ translatedText: text });
+      }
+
+      // Language codes mapping
+      const langCodes: Record<string, string> = {
+        en: "en",
+        te: "te",
+        hi: "hi",
+      };
+
+      const sourceLang = langCodes[fromLang] || "en";
+      const targetLang = langCodes[toLang] || "en";
+
+      // Using Google Translate free API
+      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`;
+
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error("Translation service error");
+      }
+
+      const data = await response.json();
+
+      // Extract translated text from response
+      let translatedText = "";
+      if (data && data[0]) {
+        for (const segment of data[0]) {
+          if (segment[0]) {
+            translatedText += segment[0];
+          }
+        }
+      }
+
+      res.json({ translatedText: translatedText || text });
+    } catch (err) {
+      console.error("[Translation] Error:", err);
+      // Return original text on error
+      res.json({ translatedText: req.body.text });
+    }
+  });
+
+  // AI Chat Route - Proxy to MedGemma
+  // Pre-warm Kaggle session before user sends first message
+  app.post(api.ai.warmSession.path, async (req, res) => {
+    try {
+      const { userId, mode, context } = api.ai.warmSession.input.parse(req.body);
+      const chatMode = mode || "symptomatic";
+      const MODEL_BASE_URL = "http://43.230.202.219:5000";
+      const sessionKey = `${userId}_${chatMode}`;
+
+      let sessionPatientInfo = context || "";
+      if (chatMode === "symptomatic") {
+        sessionPatientInfo = `You are a comprehensive medical AI assistant. You have THREE roles:\n\nROLE 1 - DIRECT QUESTIONS: When the patient asks direct questions about their own medical data (e.g., "what is my diet?", "what vaccines have I taken?", "what medications am I on?", "what is my blood group?", "what allergies do I have?"), answer DIRECTLY from the patient context provided to you. Do NOT ask follow-up questions — just give a clear, complete answer from their records.\n\nROLE 2 - SYMPTOMATIC TRIAGE: When the patient describes symptoms or health complaints, conduct a thorough interview:\n1. Ask ONE focused follow-up question per turn to gather more details.\n2. You MUST ask at least 7-10 questions before reaching any conclusion.\n3. Cover these areas systematically: onset/duration, severity (1-10 scale), location, character/quality of symptoms, aggravating/relieving factors, associated symptoms, medical history relevance, medications, recent changes.\n4. Do NOT give a diagnosis or conclusion until you have asked enough questions (at least 7 turns).\n5. Keep each response SHORT - just acknowledge what the patient said and ask the next question.\n6. After gathering sufficient information (7-10 questions), provide a comprehensive assessment with: likely conditions, recommended actions, urgency level, and when to seek emergency care.\n7. Correlate the patient's current symptoms with their detailed medical history.\n\nROLE 3 - GENERAL MEDICAL QUESTIONS: When the patient asks general health or medical knowledge questions (e.g., "what foods are good for vitamin D?", "how to lower cholesterol?", "what does high creatinine mean?"), answer directly and informatively. Do NOT force a triage interview for general knowledge questions.\n\nHOW TO DECIDE: Read each message carefully. If it is a question about the patient's own data → Role 1. If it describes symptoms → Role 2. If it is a general medical question → Role 3.\n\nCRITICAL FORMATTING RULE: Do NOT add any [FOLLOWUP_Q1], [FOLLOWUP_Q2], [FOLLOWUP_Q3] or similar tagged follow-up question markers at the end of your response. Never output these tags. Just respond naturally.\n\n${sessionPatientInfo}`;
+      }
+
+      console.log(`[WarmSession] Pre-warming ${chatMode} session for user ${userId}`);
+      const startResponse = await fetch(`${MODEL_BASE_URL}/start_session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: `${chatMode}_${userId}`,
+          patient_info: sessionPatientInfo,
+        }),
+      });
+
+      if (!startResponse.ok) {
+        console.error(`[WarmSession] Failed: ${startResponse.status}`);
+        return res.json({ success: false });
+      }
+
+      const startData = await startResponse.json();
+      const sessionId = startData.session_id || startData.sessionId || startData.id;
+      if (sessionId) {
+        medgemmaSessions.set(sessionKey, sessionId);
+        console.log(`[WarmSession] Session ready: ${sessionId}`);
+        return res.json({ success: true, sessionId });
+      }
+      res.json({ success: false });
+    } catch (err) {
+      console.error("[WarmSession] Error:", err);
+      res.json({ success: false });
+    }
+  });
+
+  app.post(api.ai.chat.path, async (req, res) => {
+    try {
+      const { message, context, reportContext, userId, isFirstMessage, mode, turnCount } =
+        api.ai.chat.input.parse(req.body);
+      const chatMode = mode || "symptomatic";
+
+      const MODEL_BASE_URL = "http://43.230.202.219:5000";
+
+      try {
+        const sessionKey = `${userId}_${chatMode}`;
+        let sessionId = medgemmaSessions.get(sessionKey);
+        let isNewSession = false;
+
+        // For diet-planner, always recreate the session when generating a new plan
+        // so the system prompt reflects the latest calorie target and preferences
+        if (chatMode === "diet-planner" && isFirstMessage) {
+          medgemmaSessions.delete(sessionKey);
+          sessionId = undefined;
+        }
+
+        if (!sessionId) {
+          console.log(
+            `[MedGemma] Starting new ${chatMode} session for user ${userId}`,
+          );
+
+          let sessionPatientInfo = context || "";
+          if (chatMode === "report-analysis") {
+            sessionPatientInfo = `You are a medical report analysis assistant. Your ONLY job is to analyze lab reports and medical test results. Do NOT ask triage questions. Do NOT act as a triage doctor. Do NOT ask for the patient's profile, age, weight, height, or full medical history.\n\nCRITICAL STATUS CLASSIFICATION RULES:\n- You MUST numerically compare each value against its reference range.\n- If value < lower bound of range → status is "Low" or "Deficient" (NEVER "Sufficiency" or "Normal").\n- If value > upper bound → status is "High" or "Elevated".\n- If value is within range → status is "Normal".\n- EXAMPLE: Vitamin D = 4.99 ng/mL, range 30-100 → 4.99 < 30 → "Severely Deficient".\n- NEVER say "Sufficiency" unless value >= lower bound of sufficient range.\n- Double-check every status: Is [value] >= [lower] AND <= [upper]?\n\nOTHER RULES:\n1. Give direct, detailed answers about lab findings with values and interpretations.\n2. ALWAYS include measurement UNITS alongside values AND reference ranges.\n3. When comparing multiple reports, include DATES beside Report labels.\n4. RECOMMENDATIONS: List specialist doctor referrals FIRST. Do NOT mention alcohol, smoking, or tobacco.\n5. When comparing reports, show what increased, decreased, or stayed the same with exact values and dates.\n6. FAMILY HISTORY: Only ask about family history when the lab findings specifically suggest a condition that could be hereditary (e.g., high cholesterol suggesting familial hypercholesterolemia, abnormal blood counts suggesting hereditary conditions). Do NOT routinely ask for family history.\n7. Base your analysis ONLY on the AI analysis of uploaded reports provided to you. Do NOT request the patient's profile or medical history.`;
+            if (reportContext) {
+              sessionPatientInfo += `\n\n[REPORT DATA - AI Analysis]:\n${reportContext}`;
+            }
+          } else if (chatMode === "symptom-followup") {
+            sessionPatientInfo = `You are a medical symptom follow-up assistant. The patient has ALREADY completed a symptom check and received a detailed analysis. Your job is to:\n1. Answer questions based on the symptoms and analysis results already provided.\n2. Give clear, direct explanations about causes, treatments, diet, medications, and lifestyle changes relevant to their specific symptoms.\n3. NEVER start a new triage interview. NEVER ask diagnostic questions like "what kind of pain?" or "how long have you had this?" — you already have all that information.\n4. Keep responses focused, practical, and specific to their symptoms.\n5. If the patient asks about something new or unrelated, answer it but connect it back to their symptoms when possible.\n\n${sessionPatientInfo}`;
+          } else if (chatMode === "meal-edit") {
+            // Neutral session for meal editing — no cuisine or diet restrictions applied here
+            sessionPatientInfo = `You are a helpful nutritionist AI. Your job is to replace or update a specific meal in a diet plan exactly as instructed. Follow the user's instructions precisely — use whatever foods the user specifies, regardless of cuisine or diet type. Calculate accurate calorie and macro values. Return only the requested meal section in the exact format specified. Never refuse a food request. Never ask questions.`;
+          } else if (chatMode === "diet-planner") {
+            const baseProfile = context || "";
+            const reportSection = reportContext ? `\n\n[PATIENT LAB REPORT VALUES]:\n${reportContext}` : "";
+
+            // Detect Indian cuisine preference for system prompt
+            const baseProfileLower = baseProfile.toLowerCase();
+            const cuisineMatchSession = baseProfileLower.match(/cuisine preference[:\s]+([a-z\s,]+?)(?:\.|,|\||$)/);
+            const cuisinePreferenceSession = cuisineMatchSession ? cuisineMatchSession[1].trim() : "";
+            const isIndianCuisineSession = cuisinePreferenceSession.includes("indian");
+            const cuisineSystemNote = isIndianCuisineSession
+              ? `\n\nCUISINE RULE (MANDATORY): The patient's cuisine preference is INDIAN. Every single meal plan you generate MUST use only Indian foods and ingredients (e.g., dal, roti, sabzi, idli, dosa, poha, upma, khichdi, chaas, lassi, makhana, sprouts chaat, Indian spices). Do NOT suggest any Western or non-Indian foods (no pasta, quinoa, granola, avocado toast, etc). If the patient's region is mentioned, prefer regionally appropriate Indian foods.`
+              : cuisinePreferenceSession
+              ? `\n\nCUISINE RULE (MANDATORY): The patient's cuisine preference is ${cuisinePreferenceSession}. All meal plans must use foods and ingredients from ${cuisinePreferenceSession} cuisine.`
+              : "";
+
+            // Extract calorie target for the session system prompt
+            const sessionCalorieMatch = baseProfile.match(/Daily calorie target:\s*(\d+)\s*kcal/i);
+            const sessionCalorieTarget = sessionCalorieMatch ? sessionCalorieMatch[1] : null;
+            const sessionCalorieRule = sessionCalorieTarget
+              ? `\n\n*** CALORIE TARGET — ABSOLUTE RULE: The patient's daily calorie target is EXACTLY ${sessionCalorieTarget} kcal. Every diet plan you generate MUST total EXACTLY ${sessionCalorieTarget} kcal. Each patient request will specify the exact kcal per meal — follow those numbers precisely. Verify the sum of all meal totals equals ${sessionCalorieTarget} kcal before writing the plan. The [MACROS] summary must reflect a total of ${sessionCalorieTarget} kcal. DO NOT generate plans with different calorie totals. ***`
+              : "";
+
+            sessionPatientInfo = `You are an expert medical nutritionist and personalized diet planner AI. Your ONLY job is to create safe, medically appropriate, and fully personalized diet plans.\n\n*** ABSOLUTE RULE — NEVER ASK QUESTIONS: You already have the patient's complete profile below. NEVER ask the patient what they eat, their routine, their food preferences, their medical conditions, or any other clarifying information. When the patient requests a diet plan, IMMEDIATELY generate the complete plan. Do NOT start with "Could you tell me..." or "Before I create your plan..." — just produce the plan directly. ***\n\n*** MANDATORY OUTPUT ORDER — every diet plan response MUST follow this structure in this exact order:\n1. ## 📋 Why This Plan — ALWAYS write this section FIRST (3-4 bullet points explaining why these foods suit this specific patient — cite their conditions, goal, food type, calorie target by name).\n2. ## 🌅 Breakfast\n3. ## 🍎 Mid-Morning Snack\n4. ## 🍽️ Lunch\n5. ## 🌆 Evening Snack\n6. ## 🌙 Dinner\n7. ## ⚠️ Foods to Avoid\n8. [MACROS: Protein Xg, Carbs Yg, Fat Zg] — last line.\nDo NOT skip any section. ***${sessionCalorieRule}\n\nPATIENT PROFILE:\n${baseProfile}${reportSection}${cuisineSystemNote}\n\nMEDICAL HISTORY & DIET HISTORY RULES:\n- You MUST carefully read the patient's [MEDICAL CONDITIONS], [BASIC INFO], [DIET HISTORY], and all other sections in the patient profile above.\n- Cross-reference the patient's medical conditions (diabetes, hypertension, anaemia, kidney disease, thyroid, PCOD, obesity, etc.) with their diet history and always tailor food choices, portion sizes, and macros accordingly.\n- Always respect the patient's food type preference (vegetarian / non-vegetarian / vegan / eggetarian) from their diet history.\n- Never include foods the patient is allergic to (check [ALLERGIES] section).\n- Factor in the patient's fitness goal (weight loss / muscle gain / maintenance) and diet adherence from their diet history when deciding calorie targets and meal complexity.\n- If the patient is on medications (check [MEDICAL CONDITIONS]), avoid food-drug interactions (e.g., avoid grapefruit for statin users, limit vitamin K for warfarin, etc.).\n\nCRITICAL ELECTROLYTE & LAB RULES — READ EVERY STATUS CAREFULLY BEFORE RECOMMENDING:\nFor each lab parameter, the STATUS is explicitly provided as HIGH, LOW, or NORMAL. You MUST apply the CORRECT dietary direction based on the STATUS — do NOT assume or apply generic kidney/disease diets blindly.\n\nSODIUM:\n- Status LOW (hyponatremia) → Patient needs MORE sodium. Include lightly salted foods, buttermilk (chaas), salted lassi, soups, rock salt. NEVER restrict sodium for a LOW sodium patient.\n- Status HIGH (hypernatremia) → Restrict sodium. Avoid salty/processed/packaged foods.\n- Status NORMAL → Maintain moderate sodium; no restriction or increase needed.\n\nPOTASSIUM:\n- Status LOW (hypokalemia) → Patient needs MORE potassium. Include bananas, coconut water, oranges, avocado, sweet potato, spinach, pomegranate, dates, rajma, moong dal.\n- Status HIGH (hyperkalemia) → Restrict potassium. Avoid bananas, oranges, tomatoes, potatoes, nuts, leafy greens in excess.\n- Status NORMAL → Maintain balanced intake; no restriction or emphasis needed.\n\nCREATININE:\n- Status HIGH (mild, 1.0–1.5 mg/dl) → Moderate protein. Prefer vegetarian proteins, egg whites, small portions of fish/chicken. Avoid red meat and excessive protein. Adequate hydration (2–2.5 L/day unless contraindicated).\n- Status HIGH (moderate/severe, >1.5 mg/dl) → Low protein diet. Consult nephrologist.\n- Status LOW → Usually low muscle mass. Normal protein intake is acceptable.\n\nUREA / BUN:\n- Status HIGH → Reduce dietary protein to ease kidney load.\n- Status LOW → Possible liver dysfunction or malnutrition; maintain adequate but not excessive protein.\n- Status NORMAL → Standard protein intake.\n\nHEMOGLOBIN / IRON:\n- Status LOW → Increase iron-rich foods: spinach, jaggery, dates, pomegranate, ragi, beetroot, horse gram. Add Vitamin C foods alongside to improve absorption.\n\nVITAMIN D:\n- Status LOW/Deficient → Recommend sun exposure, fortified foods, eggs, fatty fish, mushrooms.\n\nCHOLESTEROL / LIPIDS:\n- Status HIGH → Reduce saturated fats. Avoid ghee in excess, fried foods, full-fat dairy. Include oats, flaxseed, walnuts, olive oil.\n\nPHOSPHORUS:\n- Status HIGH → Restrict phosphorus: avoid dairy in excess, nuts, seeds, legumes, dark cola.\n- Status NORMAL/LOW → No phosphorus restriction needed.\n\nURIC ACID:\n- Status HIGH → Avoid purines: red meat, shellfish, organ meats, spinach in excess, alcohol. Increase water intake.\n\nBLOOD SUGAR / HbA1c:\n- Status HIGH → Low glycemic index diet. Avoid refined sugars, maida, white rice in excess. Include millets, oats, vegetables, bitter gourd.\n\nCRITICAL MISTAKES TO NEVER MAKE:\n1. If Sodium is LOW → NEVER advise sodium restriction. Sodium restriction for hyponatremia is dangerous.\n2. If Potassium is LOW → NEVER advise potassium restriction. Restriction worsens hypokalemia.\n3. Do NOT apply the standard "kidney failure diet" (restrict potassium + sodium + phosphorus) unless those specific parameters are actually HIGH.\n4. Always read the STATUS column before any dietary decision.\n5. If a parameter is NORMAL, do not restrict or over-supplement it.\n\nCORE RULES:\n1. Use the patient's COMPLETE medical profile to personalize every aspect of the plan — including medical conditions (diabetes, hypertension, kidney disease, etc.), current medications, allergies, fitness goal, preferred food type (vegan/vegetarian/non-veg), cuisine preference, number of meals per day, meal timings, medical diet types, and any diet history provided. If the patient has specific medical conditions, ensure the diet actively addresses them.\n2. Apply the electrolyte rules above for EVERY parameter provided. Cite the actual lab value and status in the "Why This Plan" section.\n3. Do NOT mention tobacco or smoking. Alcohol may be included only if the user explicitly requests it.\n4. Recommendations must be practical, affordable, and culturally appropriate for India.\n5. For every diet plan, use this EXACT section format:\n\n## 🌅 Breakfast\n## 🍎 Mid-Morning Snack\n## 🍽️ Lunch\n## 🌆 Evening Snack\n## 🌙 Dinner\n## ⚠️ Foods to Avoid\n## 💡 Why This Plan\n\n6. Under each meal section header (e.g. ## Breakfast), IMMEDIATELY write the meal total on the next line in bold: **~XXX kcal | Protein Xg | Carbs Yg | Fat Zg**. Then list 2-4 food items, each with its individual calorie and macro count: - Food Name, portion (~XXXkcal | Pg | Cg | Fg). NEVER put kcal or macros inside the ## heading line. NEVER write an introductory paragraph before the ## sections. Start directly with ## Why This Plan. This per-meal bold macro line and per-item calorie counts are MANDATORY.\n7. Under "Why This Plan", cite each abnormal parameter, its status, and how the plan addresses it (e.g., "Sodium is LOW at 131 mmol/L so we have included buttermilk and lightly salted foods to help restore sodium levels").\n8. For follow-up questions, give direct answers. Only use the full meal-plan format when the patient asks for a new or updated plan.\n9. At the end of every complete diet plan, add a line: [MACROS: Protein X%, Carbs Y%, Fat Z%] where X+Y+Z=100, based on the goal.`;
+          } else {
+            // Symptomatic mode: structured triage with patient context
+            sessionPatientInfo = `You are a comprehensive medical AI assistant. You have THREE roles:\n\nROLE 1 - DIRECT QUESTIONS: When the patient asks direct questions about their own medical data (e.g., "what is my diet?", "what vaccines have I taken?", "what medications am I on?", "what is my blood group?", "what allergies do I have?"), answer DIRECTLY from the patient context provided to you. Do NOT ask follow-up questions — just give a clear, complete answer from their records.\n\nROLE 2 - SYMPTOMATIC TRIAGE: When the patient describes symptoms or health complaints, conduct a thorough interview:\n1. Ask ONE focused follow-up question per turn to gather more details.\n2. You MUST ask at least 7-10 questions before reaching any conclusion.\n3. Cover these areas systematically: onset/duration, severity (1-10 scale), location, character/quality of symptoms, aggravating/relieving factors, associated symptoms, medical history relevance, medications, recent changes.\n4. Do NOT give a diagnosis or conclusion until you have asked enough questions (at least 7 turns).\n5. Keep each response SHORT - just acknowledge what the patient said and ask the next question.\n6. After gathering sufficient information (7-10 questions), provide a comprehensive assessment with: likely conditions, recommended actions, urgency level, and when to seek emergency care.\n7. Correlate the patient's current symptoms with their detailed medical history.\n\nROLE 3 - GENERAL MEDICAL QUESTIONS: When the patient asks general health or medical knowledge questions (e.g., "what foods are good for vitamin D?", "how to lower cholesterol?", "what does high creatinine mean?"), answer directly and informatively. Do NOT force a triage interview for general knowledge questions.\n\nHOW TO DECIDE: Read each message carefully. If it is a question about the patient's own data → Role 1. If it describes symptoms → Role 2. If it is a general medical question → Role 3.\n\nCRITICAL FORMATTING RULE: Do NOT add any [FOLLOWUP_Q1], [FOLLOWUP_Q2], [FOLLOWUP_Q3] or similar tagged follow-up question markers at the end of your response. Never output these tags. Just respond naturally.\n\n${sessionPatientInfo}`;
+          }
+
+          const startResponse = await fetch(`${MODEL_BASE_URL}/start_session`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: `${chatMode}_${userId}`,
+              patient_info: sessionPatientInfo,
+            }),
+          });
+
+          if (!startResponse.ok) {
+            throw new Error(`Failed to start session: ${startResponse.status}`);
+          }
+
+          const startData = await startResponse.json();
+          sessionId =
+            startData.session_id || startData.sessionId || startData.id;
+
+          if (!sessionId) {
+            throw new Error("No session ID in response");
+          }
+
+          medgemmaSessions.set(sessionKey, sessionId);
+          isNewSession = true;
+          console.log(
+            `[MedGemma] Session created: ${sessionId} for mode: ${chatMode}`,
+          );
+        }
+
+        // Build the message based on context
+        console.log(`[MedGemma] Sending message with session ${sessionId}`);
+        let enrichedMessage = message;
+
+        if (chatMode === "report-analysis") {
+          const reportRules = `CRITICAL: You MUST numerically compare each value against its reference range. If value < lower bound → "Low"/"Deficient" (NEVER "Sufficiency"). If value > upper → "High". If within range → "Normal". Example: 4.99 ng/mL in range 30-100 = Severely Deficient, NOT Sufficiency. Always include UNITS with values and reference ranges. When comparing reports, include DATES. In recommendations, list doctor referrals FIRST. Do NOT mention alcohol/smoking/tobacco. Do NOT ask for patient profile or medical history. Only ask about family history if the lab findings suggest a hereditary condition.`;
+          if (isNewSession || isFirstMessage) {
+            enrichedMessage = `You are a medical report analysis assistant. Give direct, detailed answers about lab findings. Do NOT ask triage questions. Do NOT ask for patient profile or medical history.\n${reportRules}\n\nPatient says: ${message}`;
+            if (reportContext) {
+              enrichedMessage += `\n\n[REPORT DATA - AI Analysis]:\n${reportContext}`;
+            }
+          } else if (reportContext) {
+            enrichedMessage = `IMPORTANT: Answer in 2-4 SHORT sentences only. Be concise and direct.\n\nPatient asks: ${message}\n\n[REPORT DATA - AI Analysis]:\n${reportContext}\n\nGive a brief, direct answer. Do NOT write long paragraphs. Do NOT ask triage questions. Do NOT ask for patient profile or medical history. ${reportRules}`;
+          } else {
+            enrichedMessage = `IMPORTANT: Answer in 2-4 SHORT sentences only. Be concise and direct.\n\nPatient asks: ${message}\n\nAnswer briefly using the report context from this session. Do NOT write long paragraphs. Do NOT ask triage questions. Do NOT ask for patient profile or medical history. ${reportRules}`;
+          }
+        } else if (chatMode === "symptom-followup") {
+          if (isNewSession || isFirstMessage) {
+            enrichedMessage = `[SYMPTOM ANALYSIS CONTEXT - Use this to answer ALL questions in this conversation:\n${context || "No context provided"}]\n\nPatient asks: ${message}\n\nIMPORTANT RULES:\n- You have ALREADY analyzed this patient's symptoms. The full analysis is in the context above.\n- Answer DIRECTLY based on the symptoms, causes, and analysis already provided.\n- Do NOT start a new triage interview. Do NOT ask follow-up diagnostic questions like "what kind of cough?" or "how long have you had this?"\n- The patient wants clarification, explanations, or guidance about their EXISTING symptoms and analysis.\n- Keep answers focused, clear, and directly relevant to their specific symptoms.\n- If the patient asks about something related to their symptoms (diet, medication, lifestyle), answer specifically for their condition.\n- If the patient asks a general medical question, answer it but relate it back to their symptoms when relevant.`;
+          } else {
+            enrichedMessage = `Patient asks: ${message}\n\nAnswer DIRECTLY based on the symptom analysis context you already have. Do NOT ask diagnostic questions or start a triage interview. Give clear, specific answers related to the patient's symptoms and the analysis already provided.`;
+          }
+        } else if (chatMode === "meal-edit") {
+          // Meal edit mode: no cuisine restriction, just follow the message instructions directly
+          enrichedMessage = message;
+        } else if (chatMode === "diet-planner") {
+          const isGenerateDayRequest = /generate (day \d+|my|personalized|a) diet plan/i.test(message) || message.trim().toLowerCase() === "generate my personalized diet plan";
+          if (isNewSession || isFirstMessage || isGenerateDayRequest) {
+            const electrolyteCriticalReminder = reportContext
+              ? `\n\nCRITICAL REMINDER BEFORE GENERATING THE PLAN:\n- Check the STATUS (HIGH/LOW/NORMAL) of EVERY lab parameter above.\n- LOW Sodium → include sodium (buttermilk, salted foods). Do NOT restrict sodium.\n- LOW Potassium → include potassium-rich foods (bananas, coconut water, sweet potato, dates). Do NOT restrict potassium.\n- HIGH Creatinine → moderate protein only. Do NOT apply blanket kidney-failure diet rules unless creatinine is severely elevated.\n- HIGH Potassium (not LOW) → then restrict potassium-rich foods.\n- NORMAL values → no restriction or supplementation for that parameter.\n- In "Why This Plan", cite each abnormal parameter by name, its actual value, its status, and how the plan addresses it.`
+              : "";
+
+            // Detect cuisine preference from the context string
+            const contextLower = (context || "").toLowerCase();
+            const cuisineMatch = contextLower.match(/cuisine preference[:\s]+([a-z\s,]+?)(?:\.|,|\||$)/);
+            const cuisinePreference = cuisineMatch ? cuisineMatch[1].trim() : "";
+            const isIndianCuisine = cuisinePreference.includes("indian");
+
+            const indianCuisineInstruction = isIndianCuisine
+              ? `\n\nINDIAN CUISINE REQUIREMENT (MANDATORY): The patient's cuisine preference is Indian. You MUST provide an exclusively Indian diet plan using only Indian foods, ingredients, and meal names:\n- Breakfast options: idli, dosa, upma, poha, paratha, roti with sabzi, dal, besan chilla, oats khichdi, daliya, uttapam, etc.\n- Mid-morning: chaas (buttermilk), lassi, coconut water, fruits, roasted chana, murmura, sattu drink, etc.\n- Lunch: dal, roti/chapati/jowar roti, rice, sabzi (seasonal vegetables), raita, salad, sambar, etc.\n- Evening snack: sprouts chaat, makhana, roasted chana, poha, dhokla, idli, etc.\n- Dinner: khichdi, dal-roti, sabzi, soup, dalia, ragi roti, etc.\n- Use Indian spices and cooking methods (turmeric, cumin, coriander, ginger, garlic, mustard seeds, steaming, sauteing, pressure cooking).\n- Include region-appropriate meals if the patient's region or state is mentioned.\n- Do NOT suggest non-Indian foods like pasta, quinoa, avocado toast, granola, or any Western/international food items.`
+              : cuisinePreference
+              ? `\n\nCUISINE REQUIREMENT: The patient's cuisine preference is ${cuisinePreference}. Tailor ALL meal suggestions to use foods, ingredients, and meal names typical of ${cuisinePreference} cuisine only.`
+              : "";
+
+            // Extract calorie target from context to enforce strictly
+            const calorieMatch = (context || "").match(/Daily calorie target:\s*(\d+)\s*kcal/i);
+            const calorieTarget = calorieMatch ? calorieMatch[1] : null;
+            const strictCalorieRule = calorieTarget
+              ? `\n\n*** MANDATORY CALORIE RULE — NON-NEGOTIABLE: The patient's daily calorie target is EXACTLY ${calorieTarget} kcal. Use the exact per-meal kcal targets specified in the patient request above — those are the final authoritative numbers. Do NOT deviate from them. The sum of ALL meal calories MUST equal EXACTLY ${calorieTarget} kcal. Verify your total before writing the plan. The [MACROS] line at the end MUST reflect totals that sum to ${calorieTarget} kcal. ***`
+              : "";
+
+            enrichedMessage = `${context ? `Patient context: ${context}\n\n` : ""}${reportContext ? `Lab Report:\n${reportContext}` : ""}${electrolyteCriticalReminder}${indianCuisineInstruction}${strictCalorieRule}\n\nPatient request: ${message}\n\n*** CRITICAL — DO NOT ASK ANY QUESTIONS. IMMEDIATELY generate the complete diet plan. ***\n\nOUTPUT STRUCTURE (copy this format EXACTLY — no deviations):\n\n## 📋 Why This Plan\n- reason 1\n- reason 2\n- reason 3\n\n## 🌅 Breakfast\n**~XXX kcal | Protein Xg | Carbs Yg | Fat Zg**\n- Food Name, portion (~XXXkcal | Pg | Cg | Fg)\n- Food Name, portion (~XXXkcal | Pg | Cg | Fg)\n\n## 🍎 Mid-Morning Snack\n**~XXX kcal | Protein Xg | Carbs Yg | Fat Zg**\n- Food Name, portion (~XXXkcal | Pg | Cg | Fg)\n\n## 🍽️ Lunch\n**~XXX kcal | Protein Xg | Carbs Yg | Fat Zg**\n- Food Name, portion (~XXXkcal | Pg | Cg | Fg)\n- Food Name, portion (~XXXkcal | Pg | Cg | Fg)\n- Food Name, portion (~XXXkcal | Pg | Cg | Fg)\n\n## 🌆 Evening Snack\n**~XXX kcal | Protein Xg | Carbs Yg | Fat Zg**\n- Food Name, portion (~XXXkcal | Pg | Cg | Fg)\n\n## 🌙 Dinner\n**~XXX kcal | Protein Xg | Carbs Yg | Fat Zg**\n- Food Name, portion (~XXXkcal | Pg | Cg | Fg)\n- Food Name, portion (~XXXkcal | Pg | Cg | Fg)\n\n## ⚠️ Foods to Avoid\n- food: reason\n\n[MACROS: Protein Xg, Carbs Yg, Fat Zg]\n\nMANDATORY FORMAT RULES — BREAKING THESE RULES IS NOT ALLOWED:\n1. The ## headings (Breakfast, Lunch, etc.) contain ONLY the emoji + meal name. NEVER put kcal or macros inside the ## heading line.\n2. The **bold line** immediately after the ## heading shows the TOTAL kcal and macros for that meal — this MUST equal the sum of all individual food item calories listed below it.\n3. Each food item MUST include its individual calorie and macro count in the format (~XXXkcal | Pg | Cg | Fg) — this is mandatory for every food item.\n4. MATH CHECK (mandatory before writing each meal): Add up all individual food item kcal values. That sum MUST equal the meal total in the **bold line**. If they don't match, adjust the item portions until they do.\n5. DAILY TOTAL CHECK: Sum of all meal totals MUST equal exactly ${calorieTarget || "the patient's target"} kcal.\n6. Do NOT write any introductory paragraph before the ## sections. Start directly with ## 📋 Why This Plan.\n7. Do NOT write any text after [MACROS: ...]. No summaries, no conclusions, no questions.\n8. Use ONLY the patient context — it already contains all needed info.\n9. NEVER include allergen foods. Respect food type (veg/non-veg/vegan/eggetarian).`;
+          } else {
+            enrichedMessage = `Patient: ${message}\n\nRespond directly to the question. Do NOT add [FOLLOWUP_Q] lines or any follow-up question markers.`;
+          }
+        } else {
+          // Symptomatic mode: inject conclusion trigger after 7+ turns
+          const currentTurn = turnCount ?? 0;
+          if (currentTurn >= 7) {
+            enrichedMessage = `${message}\n\n[You have now asked enough questions. STOP asking more questions. Provide your CONCLUSIVE ASSESSMENT now: state the most likely condition(s), urgency level (routine/urgent/emergency), and recommended next steps. Keep it clear and patient-friendly.]`;
+          } else {
+            enrichedMessage = `${message}\n\n[RULE: Reply in 1-2 SHORT sentences only. Acknowledge briefly, then ask EXACTLY ONE follow-up question. No lists, no preamble, no multiple questions.]`;
+          }
+        }
+
+        // Follow-up chips only for report-analysis and symptom-followup modes
+        const followUpInstruction = (chatMode === "diet-planner" || chatMode === "symptomatic" || chatMode === "meal-edit") ? "" : `\n\nAFTER your response, on a NEW line, add exactly 3 follow-up questions that a PATIENT would naturally ask about their condition, formatted as:\n[FOLLOWUP_Q1] <question 1>\n[FOLLOWUP_Q2] <question 2>\n[FOLLOWUP_Q3] <question 3>\nThese must be written from the patient's perspective — things a worried patient would want to know, such as "Is this something serious?", "What kind of doctor should I see?", "Could my diet be causing this?", "Do I need any tests done?". Keep them short (under 15 words), specific to the symptoms discussed, and in simple everyday language. Do NOT write doctor-style clinical questions.`;
+        if (followUpInstruction) enrichedMessage += followUpInstruction;
+
+        const symptomaticConcluding = chatMode === "symptomatic" && (turnCount ?? 0) >= 7;
+        const maxTokens = chatMode === "report-analysis" ? (isFirstMessage ? 400 : 300) : chatMode === "symptom-followup" ? 1200 : chatMode === "diet-planner" ? 6000 : chatMode === "meal-edit" ? 1200 : symptomaticConcluding ? 350 : 160;
+        const temperature = chatMode === "symptomatic" ? 0.2 : 0.3;
+        // Strip surrogate-pair emoji characters that cause UnicodeEncodeError in the Python backend
+        const safeMessage = enrichedMessage.replace(/[\uD800-\uDFFF]/g, "").replace(/[^\u0000-\uFFFF]/g, "");
+        const chatResponse = await fetch(`${MODEL_BASE_URL}/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionId || "default",
+            message: safeMessage,
+            max_tokens: maxTokens,
+            temperature: temperature,
+          }),
+        });
+
+        if (!chatResponse.ok) {
+          console.error(
+            `[MedGemma] Chat endpoint error: ${chatResponse.status}`,
+          );
+          // If session is invalid, clear it and retry
+          if (chatResponse.status === 400 || chatResponse.status === 401) {
+            medgemmaSessions.delete(sessionKey);
+            throw new Error("Session invalid, will retry");
+          }
+          throw new Error(`Chat failed: ${chatResponse.status}`);
+        }
+
+        const chatData = await chatResponse.json();
+        let rawReply =
+          chatData.response ||
+          chatData.message ||
+          chatData.text ||
+          "I understood your symptoms.";
+
+        const followUpRegex = /\[FOLLOWUP_Q\d\]\s*(.+)/g;
+        const followUps: string[] = [];
+        let match;
+        while ((match = followUpRegex.exec(rawReply)) !== null) {
+          followUps.push(match[1].trim());
+        }
+
+        let cleanReply = rawReply.replace(/\[FOLLOWUP_Q\d\]\s*.+/g, "").trim();
+
+        // Strip leaked system-prompt preamble the model sometimes echoes back
+        cleanReply = cleanReply
+          .replace(/^Okay,\s*I\s*will\s*act\s*accordingly.*?\.\s*/i, '')
+          .replace(/^Okay,\s*I\s*will\s*respond\s*according\s*to\s*the\s*instructions?\s*given\s*above\.?\s*/i, '')
+          .replace(/^Sure,\s*I\s*will\s*follow.*?\.\s*/i, '')
+          .replace(/^I\s*understand.*?instructions.*?\.\s*/i, '')
+          .replace(/^Based\s*on\s*the\s*instructions?\s*given.*?\.\s*/i, '')
+          .replace(/\bROLE\s*[123]\s*[-–—]\s*(?:DIRECT\s*QUESTIONS?|SYMPTOMATIC\s*TRIAGE|GENERAL\s*MEDICAL\s*QUESTIONS?)\s*:?/gi, '')
+          .replace(/\bRole\s*[123]\s*[-–—]\s*(?:Direct\s*Questions?|Symptomatic\s*Triage|General\s*Medical\s*Questions?)\s*:?/gi, '')
+          .replace(/^(Patient\s*says:|Patient\s*asks:|Patient:)\s*/i, '')
+          // Strip follow-up questions intro preamble that leaks into the reply
+          .replace(/\n*(?:Based\s+on\s+(?:the\s+)?(?:information|analysis|report|findings|context|above|your\s+report)[^,\n]*,?\s*)?(?:here\s+are|I\s+(?:have\s+)?(?:also\s+)?(?:prepared|added|included|suggest))\s+(?:\d+\s+)?follow[- ]?up\s+questions?\s+(?:that\s+)?(?:a\s+patient\s+(?:might|would|could)\s+(?:naturally\s+)?ask|you\s+might\s+want\s+to\s+ask|for\s+you)[^:\n]*:?\s*$/gi, '')
+          // Strip "Follow-Up Questions:" section and everything after it
+          .replace(/\n*\*?\*?Follow[- ]?Up\s+Questions?\*?\*?\s*:[\s\S]*/gi, '')
+          // Strip structured report sections that shouldn't appear in chat responses
+          .replace(/\n*\*?\*?(?:Probable\s+Causes?|Precautions?|Immediate\s+Actions?|When\s+to\s+Worry|Recommended\s+Doctor|Follow\s+Up)\*?\*?\s*:[\s\S]*/gi, '')
+          .trim();
+
+        // If cleanReply is empty (model only generated follow-ups), return a fallback
+        const finalReply = cleanReply.trim() || "I understand your question. Based on the report data, please ask a specific question about a parameter value, what it means, or what action you should take.";
+
+        const returnedFollowUps = chatMode === "symptomatic" ? [] : followUps;
+        console.log(
+          `[MedGemma] Response received: ${finalReply.substring(0, 50)}... | Follow-ups: ${returnedFollowUps.length}`,
+        );
+        res.json({ response: finalReply, followUpQuestions: returnedFollowUps });
+      } catch (fetchError) {
+        console.error("[MedGemma] Error:", fetchError);
+        res.json({
+          response:
+            "I'm having difficulty reaching the medical AI right now, but I'm listening carefully. Tell me more about your symptoms.",
+          followUpQuestions: [],
+        });
+      }
+    } catch (err) {
+      console.error("[MedGemma] Request parsing error:", err);
+      res.status(400).json({ message: "Invalid chat request" });
+    }
+  });
+
+  // Suggest Related Symptoms
+  app.post(api.ai.suggestSymptoms.path, async (req, res) => {
+    try {
+      const { symptom } = api.ai.suggestSymptoms.input.parse(req.body);
+      const MODEL_BASE_URL = "http://43.230.202.219:5000";
+
+      try {
+        const startResponse = await fetch(`${MODEL_BASE_URL}/start_session`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: `suggest_${Date.now()}`,
+            patient_info: "You are a medical symptom suggestion assistant. When given a symptom, suggest 6 commonly associated symptoms. Return ONLY a JSON array of strings, nothing else.",
+          }),
+        });
+
+        if (!startResponse.ok) throw new Error("Failed to start session");
+        const startData = await startResponse.json();
+        const sessionId = startData.session_id || startData.sessionId || startData.id;
+
+        const chatResponse = await fetch(`${MODEL_BASE_URL}/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionId || "default",
+            message: `The patient reports: "${symptom}". List exactly 6 common symptoms that are often associated with or co-occur with this complaint. Return ONLY a JSON array of short symptom names like: ["Fever","Headache","Nausea","Fatigue","Body Pain","Chills"]. No explanation, no other text, just the JSON array.`,
+            max_tokens: 200,
+            temperature: 0.3,
+          }),
+        });
+
+        if (!chatResponse.ok) throw new Error("Chat failed");
+        const chatData = await chatResponse.json();
+        const reply = chatData.response || chatData.message || chatData.text || "";
+
+        const jsonMatch = reply.match(/\[[\s\S]*?\]/);
+        if (jsonMatch) {
+          try {
+            const suggestions = JSON.parse(jsonMatch[0]);
+            res.json({ suggestions: suggestions.slice(0, 8) });
+            return;
+          } catch {}
+        }
+
+        const lines = reply.split(/[\n,]/).map((l: string) => l.replace(/^[\d.\-*•\s"]+/, '').replace(/["'\]]/g, '').trim()).filter((l: string) => l.length > 1 && l.length < 40);
+        res.json({ suggestions: lines.slice(0, 8) });
+      } catch (fetchError) {
+        console.error("[SuggestSymptoms] Error:", fetchError);
+        const fallbackMap: Record<string, string[]> = {
+          fever: ["Headache", "Body Pain", "Chills", "Fatigue", "Cough", "Sore Throat"],
+          headache: ["Nausea", "Dizziness", "Eye Pain", "Neck Stiffness", "Sensitivity to Light", "Fatigue"],
+          cough: ["Sore Throat", "Fever", "Runny Nose", "Chest Tightness", "Shortness of Breath", "Wheezing"],
+          stomach: ["Nausea", "Vomiting", "Bloating", "Diarrhea", "Loss of Appetite", "Cramps"],
+          pain: ["Swelling", "Stiffness", "Weakness", "Numbness", "Redness", "Fever"],
+        };
+        const lower = symptom.toLowerCase();
+        const matched = Object.keys(fallbackMap).find(k => lower.includes(k));
+        res.json({ suggestions: matched ? fallbackMap[matched] : ["Fever", "Headache", "Nausea", "Fatigue", "Body Pain", "Chills"] });
+      }
+    } catch (err) {
+      console.error("[SuggestSymptoms] Parse error:", err);
+      res.status(400).json({ message: "Invalid request" });
+    }
+  });
+
+  // Symptom Check - Full Analysis
+  app.post(api.ai.symptomCheck.path, async (req, res) => {
+    try {
+      const { userId, symptom, relatedSymptoms, onset, severity, context } = api.ai.symptomCheck.input.parse(req.body);
+      const MODEL_BASE_URL = "http://43.230.202.219:5000";
+
+      const symptomSummary = `Primary complaint: ${symptom}${relatedSymptoms.length > 0 ? `. Additional symptoms: ${relatedSymptoms.join(", ")}` : ""}. Duration: ${onset}. Severity: ${severity}.`;
+
+      const prompt = `You are a medical symptom assessment assistant. A patient has reported the following:
+
+${context ? `--- PATIENT BACKGROUND ---\n${context}\n--- END PATIENT BACKGROUND ---` : ""}
+${symptomSummary}
+
+You MUST answer ALL 13 questions below in ORDER. Use the EXACT question text as section headers. Give clear, practical, non-alarming answers in simple language. Be specific to the reported symptoms.
+
+1. What could this be?
+List probable causes from most common to least common. Use non-alarming language. Be specific to the symptoms described.
+
+2. To which doctor should I refer?
+Based on the symptoms, recommend which type of specialist doctor the patient should consult. Always start with General Physician as the first recommendation. Then list any relevant specialists (e.g., Gastroenterologist for stomach issues, Neurologist for headaches, Orthopedist for joint pain). Explain briefly why each specialist is relevant.
+
+3. Should I be worried?
+Give a clear YES / NO / MAYBE with a one-line reason. If NO — say it confidently. If YES — say exactly why.
+
+4. Do I need to go to a hospital right now?
+List red flag symptoms that warrant emergency care vs. symptoms that can wait for an OPD visit.
+
+5. How urgent is this?
+Choose ONE: See a doctor today / within 3 days / within a week / monitor at home. Explain briefly.
+
+6. What can I do right now at home?
+Give immediate actionable steps — rest, hydration, OTC medication if safe, positioning, etc.
+
+7. What should I avoid?
+List foods, activities, medications, or behaviors that could make this worse.
+
+8. What should I eat or drink?
+Give specific dietary guidance relevant to the symptoms.
+
+9. Can I take any medicine on my own?
+Suggest safe OTC options with dosage, and clearly warn about what NOT to self-medicate. IMPORTANT: You MUST end this section with the following disclaimer on a new line: "Disclaimer: Do not self-medicate. Please consult a General Physician before taking any medication."
+
+10. What symptoms should I watch out for?
+List specific warning signs that indicate the condition is worsening — be actionable and specific.
+
+11. Is this related to something I already have?
+${context ? `This patient has the following background: ${context}. Based on this, explain specifically how their travel history, medical conditions, medications, allergies, family history, or lifestyle may relate to the current symptoms. Be specific — cite the actual data points (e.g., travel to Jharkhand, recent contact with sick person, etc.).` : `No patient background was provided. Answer: "No relevant medical history on file. Please update your medical history profile for a more personalized answer."`}
+
+12. What will the doctor likely ask me?
+Prepare the patient — duration, severity, associated symptoms, triggers — so they don't forget anything in the consultation.
+
+13. What tests might the doctor suggest?
+List common investigations for this symptom cluster, explained simply.
+
+CRITICAL FORMATTING RULES:
+- Answer ALL 13 questions in the exact order shown above.
+- Use the EXACT question text as headers (copy-paste the question exactly). Do NOT rephrase, shorten, or paraphrase any heading.
+- For example, question 2 MUST appear as "To which doctor should I refer?" — NOT "To whom should I refer?" or any other variation.
+- Do NOT echo the instructions or question descriptions in your answer. Only provide the actual answer content under each heading.
+- Do NOT include text like "Give a clear YES/NO/MAYBE", "Choose ONE:", "List probable causes" etc. — these are instructions for you, NOT content to display.
+- For question 11 specifically: Do NOT repeat the patient background data or instruction text. Only write your medical analysis of how the background relates to the symptoms.
+- Be concise but thorough. Do NOT skip any question.`;
+
+      try {
+        const startResponse = await fetch(`${MODEL_BASE_URL}/start_session`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: `check_${userId}_${Date.now()}`,
+            patient_info: "You are a medical symptom assessment assistant. Answer all questions thoroughly and specifically based on the symptoms described.",
+          }),
+        });
+
+        if (!startResponse.ok) throw new Error("Failed to start session");
+        const startData = await startResponse.json();
+        const sessionId = startData.session_id || startData.sessionId || startData.id;
+
+        const chatResponse = await fetch(`${MODEL_BASE_URL}/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionId || "default",
+            message: prompt,
+            max_tokens: 3000,
+            temperature: 0.3,
+          }),
+        });
+
+        if (!chatResponse.ok) throw new Error(`Chat failed: ${chatResponse.status}`);
+        const chatData = await chatResponse.json();
+        const reply = chatData.response || chatData.message || chatData.text || "Unable to analyze symptoms at this time.";
+
+        console.log(`[SymptomCheck] Response received: ${reply.substring(0, 100)}...`);
+        res.json({ response: reply });
+      } catch (fetchError) {
+        console.error("[SymptomCheck] Error:", fetchError);
+        res.json({
+          response: "I'm having difficulty reaching the medical AI right now. Please try again in a moment.",
+        });
+      }
+    } catch (err) {
+      console.error("[SymptomCheck] Parse error:", err);
+      res.status(400).json({ message: "Invalid symptom check request" });
+    }
+  });
+
+  // Medical Reports Routes
+  app.post(api.reports.create.path, async (req, res) => {
+    try {
+      const { userId, reportType, fileName, reportText } =
+        api.reports.create.input.parse(req.body);
+      const report = await storage.createMedicalReport({
+        userId,
+        reportType,
+        fileName,
+        reportText,
+      });
+      res.status(201).json(report);
+    } catch (err) {
+      console.error("[Reports] Create error:", err);
+      res.status(400).json({ message: "Invalid report data" });
+    }
+  });
+
+  app.get(api.reports.list.path, async (req, res) => {
+    const userId = parseInt(req.params.userId);
+    const reports = await storage.getMedicalReports(userId);
+    res.json(reports);
+  });
+
+  app.get(api.reports.get.path, async (req, res) => {
+    const id = parseInt(req.params.id);
+    const report = await storage.getMedicalReport(id);
+    if (!report) {
+      return res.status(404).json({ message: "Report not found" });
+    }
+    res.json(report);
+  });
+
+  // ============================================================
+  // HYBRID CLINICAL AI: Deterministic Parameter Parser & Classifier
+  // Code does the classification (100% accurate), LLM only explains
+  // ============================================================
+  interface ParsedParameter {
+    name: string;
+    value: number;
+    unit: string;
+    rangeLow: number;
+    rangeHigh: number;
+    rangeUnit: string;
+    status: "Normal" | "Low" | "High";
+    rawValue: string;
+    rawRange: string;
+    matchedTier?: string;
+  }
+
+  function parseAndClassifyParameters(reportText: string): ParsedParameter[] {
+    const parameters: ParsedParameter[] = [];
+
+    const TAB_UNIT_RE = /^(mg\/d[lL]|mg\/g|g\/d[lL]|IU\/L|U\/L|uIU\/mL|mmol\/L|µmol\/L|ng\/mL|ng\/d[lL]|pg\/mL|mEq\/L|%|lakhs|million|cumm|cells\/cumm|thou\/uL|mill\/uL|fL|g%|gm\/dL|gm\/dl|sec|mm\/hr|ug\/[lL]|µg\/[lL]|IU\/mL|mIU\/mL|U\/mL|mg\/L|g\/L|copies\/mL|log\s*copies\/mL|ratio|index|mL\/min\/[{(]?[\d._]+[m2\)}]?|mL\/min|L\/min)$/i;
+    const preProcessed = reportText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const preLines = preProcessed.split('\n');
+    const rewrittenLines: string[] = [];
+
+    for (const pl of preLines) {
+      if (pl.includes('\t')) {
+        const segments = pl.split('\t').map(s => s.trim()).filter(Boolean);
+        if (segments.length >= 3 && segments.length <= 6) {
+          let unitSeg = -1, valSeg = -1, nameSeg = -1, rangeSeg = -1;
+
+          for (let si = 0; si < segments.length; si++) {
+            const seg = segments[si];
+            if (unitSeg < 0 && TAB_UNIT_RE.test(seg)) {
+              unitSeg = si;
+            }
+          }
+
+          for (let si = 0; si < segments.length; si++) {
+            if (si === unitSeg) continue;
+            const seg = segments[si];
+            if (valSeg < 0 && /^[<>]?\s*\d+([.,]\d+)?$/.test(seg)) {
+              valSeg = si;
+            }
+          }
+
+          for (let si = 0; si < segments.length; si++) {
+            if (si === unitSeg || si === valSeg) continue;
+            const seg = segments[si];
+            if (nameSeg < 0 && /[a-zA-Z]{2,}/.test(seg) && !/^\d+(\.\d+)?\s*[-–]\s*\d+/.test(seg) && !/(?:less\s+than|deficiency|insufficiency|sufficiency|hypoglyc|non-?diabetic)/i.test(seg)) {
+              nameSeg = si;
+            }
+          }
+
+          for (let si = 0; si < segments.length; si++) {
+            if (si === unitSeg || si === valSeg || si === nameSeg) continue;
+            const seg = segments[si];
+            if (rangeSeg < 0 && seg.length > 1) {
+              rangeSeg = si;
+            }
+          }
+
+          if (nameSeg >= 0 && valSeg >= 0) {
+            const name = segments[nameSeg];
+            const val = segments[valSeg];
+            const unit = unitSeg >= 0 ? segments[unitSeg] : '';
+            const range = rangeSeg >= 0 ? segments[rangeSeg] : '';
+
+            if (/parameter|investigation|test\s+name|result|units|reference/i.test(name)) {
+              rewrittenLines.push(pl.replace(/\t/g, '  '));
+              continue;
+            }
+
+            const rebuilt = `${name}  ${val}  ${unit}  ${range}`;
+            console.log(`[TabReorder] Reordered: "${rebuilt.substring(0, 120)}"`);
+            rewrittenLines.push(rebuilt);
+            continue;
+          }
+        }
+      }
+      rewrittenLines.push(pl.replace(/\t/g, '  '));
+    }
+
+    let normalized = rewrittenLines.join('\n');
+
+    normalized = normalized.replace(/&gt;/g, '>');
+    normalized = normalized.replace(/&lt;/g, '<');
+    normalized = normalized.replace(/&amp;/g, '&');
+    normalized = normalized.replace(/&quot;/g, '"');
+    normalized = normalized.replace(/&#39;/g, "'");
+    normalized = normalized.replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+    normalized = normalized.replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)));
+
+    normalized = normalized.replace(/([a-zA-Z])-\n([a-zA-Z])/g, '$1$2');
+    normalized = normalized.replace(/(Glu)-\s*(cose)/gi, '$1$2');
+    normalized = normalized.replace(/(melli)-\s*(tus)/gi, '$1$2');
+    normalized = normalized.replace(/(Diabe)-\s*(tes)/gi, '$1$2');
+
+    // Join "Less" on one line with "than N" on next line (OCR line-break artifact)
+    normalized = normalized.replace(/\bLess\s*\n\s*than\b/gi, 'Less than');
+    // Join lines ending with "|" pipe continuation
+    normalized = normalized.replace(/\|\s*\n\s*/g, '| ');
+
+    normalized = normalized.replace(/(\d)\s*7=\s*(\d)/g, '$1 >= $2');
+    normalized = normalized.replace(/^7=\s*(\d)/gm, '>= $1');
+
+    // Merge multi-line parameter entries where the name is split from its value.
+    // Pattern: text-only line (name) + optional short parenthetical line (abbreviation) + value line starting with digits.
+    // e.g. "Estimated Glomerular Filtration Rate\n(eGFR)\n48 mL/min/..." → "Estimated Glomerular Filtration Rate (eGFR) 48 mL/min/..."
+    normalized = normalized.replace(
+      /^([A-Za-z][A-Za-z\s/().,&-]{4,})\n(\([A-Za-z][A-Za-z0-9/\s._-]*\))\n([\d])/gm,
+      '$1 $2 $3'
+    );
+    // Also handle: text-only name line directly followed by value line (no abbreviation line)
+    normalized = normalized.replace(
+      /^([A-Za-z][A-Za-z\s/().,&-]{4,})\n([\d]+\s+[a-zA-Z])/gm,
+      (match, name, rest) => {
+        // Only merge if the name line contains no digits (pure parameter name)
+        if (/\d/.test(name)) return match;
+        return `${name} ${rest}`;
+      }
+    );
+
+    const rawLines = normalized.split('\n');
+    
+    const mergedLines: string[] = [];
+    for (let i = 0; i < rawLines.length; i++) {
+      const cur = rawLines[i].trim();
+      if (!cur) { mergedLines.push(rawLines[i]); continue; }
+
+      if (/\b(?:Hypoglyc|Diabetes\s+mellitus|Impaired\s+Glu|Normal\s+Less|Borderline|Desirable|Pre[\s-]?Diabet)/i.test(cur)) {
+        console.log(`[Merge-Debug] Line ${i} triggered tier keyword: "${cur.substring(0, 80)}"`);
+        let block = cur;
+        let j = i + 1;
+        let linesAdded = 0;
+        while (j < rawLines.length && j <= i + 6) {
+          const next = rawLines[j].trim();
+          if (!next) { j++; continue; }
+          if (/^(patient|age|sex|gender|date|time|ward|bed|sample|lab|report|hospital|doctor|referred|specimen|department|collected|received|reported|method|instrument)\b/i.test(next)) break;
+          if (/^[-=_*#]{3,}$/.test(next)) break;
+          if (/^(Detailed|Summary|Page|Powered|End\s+of)/i.test(next)) break;
+
+          if (/(?:less\s+than|>=|>\s*=|^than\s+\d+|Hypoglyc|Normal|Impaired|Diabetes|Diabetic|Borderline|Desirable|Optimal|\d+\s*[-–]\s*\d+)/i.test(next) || /^\d+\s*(mg|g|IU|U|mmol|ng|pg|mEq|%|lakhs|million|cumm)/i.test(next) || (/^\d+\.?\d*$/.test(next.trim()) && /[<>]=?\s*$/.test(block))) {
+            console.log(`[Merge-Debug]   Adding line ${j}: "${next.substring(0, 80)}"`);
+            block += ' ' + next;
+            linesAdded++;
+            j++;
+          } else {
+            console.log(`[Merge-Debug]   Stopped at line ${j}: "${next.substring(0, 80)}" (no match)`);
+            break;
+          }
+        }
+
+        console.log(`[Merge-Debug]   Built block with ${linesAdded} additional lines: "${block.substring(0, 150)}"`);
+        
+        if (/\|/.test(block) || (/less\s+than/i.test(block) && /(?:Impaired|Diabetes|Borderline|Desirable)/i.test(block)) || (/[<>]=?\s*\d/.test(block) && /(?:Impaired|Diabet|Borderline|Desirable|Pre[\s-]?Diabet|Non[\s-]?Diabet)/i.test(block))) {
+          console.log(`[Merge-Debug]   ✓ Block passed merge condition`);
+          if (mergedLines.length > 0) {
+            const lastIdx = mergedLines.length - 1;
+            const lastLine = mergedLines[lastIdx].trim();
+            if (lastLine && !/^[-=_*#]{3,}$/.test(lastLine) && !lastLine.includes('|')) {
+              mergedLines[lastIdx] = mergedLines[lastIdx] + '  ' + block;
+            } else {
+              mergedLines.push(block);
+            }
+          } else {
+            mergedLines.push(block);
+          }
+          i = j - 1;
+          continue;
+        } else {
+          console.log(`[Merge-Debug]   ✗ Block did NOT pass merge condition (no pipe, or missing tier keywords)`);
+        }
+      }
+      mergedLines.push(rawLines[i]);
+    }
+
+    const lines = mergedLines;
+
+    const metadataExact = /^(patient\s*(name|id|details)|age\s*[:\/]|sex\s*[:\/]|gender\s*[:\/]|date\s*(of|[:\/])|time\s*[:\/]|ward\s*[:\/]|bed\s*[:\/]|sample\s*(type|id|no)|lab\s*(no|id|number)|report\s*(no|id|date)|hospital|doctor\s*[:\/]|referred\s*by|specimen|barcode|registration|uhid|mr\s*no|op\s*no|ip\s*no|department\s*[:\/]|collected|received|reported|method\s*[:\/]|instrument\s*[:\/ ])/i;
+
+    const UNIT_PAT = `[a-zA-Z%/\u00b5\u03bcx][a-zA-Z0-9%/\u00b5\u03bc.*^(){}\\-_]*(?:\\/[a-zA-Z0-9%\u00b5\u03bc.*^(){}_]+)*`;
+    const RANGE_SEP = `[-\u2013\u2014]|\\s+to\\s+`;
+
+    function classify(v: number, l: number, h: number): "Normal" | "Low" | "High" {
+      if (v < l) return "Low";
+      if (v > h) return "High";
+      return "Normal";
+    }
+
+    function correctArrowArtifact(val: string, _low: number, _high: number): string {
+      return val;
+    }
+
+    function addParam(
+      name: string,
+      val: string,
+      low: string,
+      high: string,
+      unit: string,
+      rangeUnit?: string,
+      displayRangeOverride?: string
+    ) {
+      const cleanName = name.replace(/[:;,]+$/, '').trim();
+      if (!cleanName || cleanName.length < 2) return;
+      const l = parseFloat(low), h = parseFloat(high);
+      if (isNaN(l) || isNaN(h) || l > h) return;
+      if (l === 0 && h === 0) return;
+
+      const correctedVal = correctArrowArtifact(val, l, h);
+      const v = parseFloat(correctedVal);
+      if (isNaN(v)) return;
+
+      const u = (unit || '').trim();
+      const ru = (rangeUnit || unit || '').trim();
+
+      let displayRange = displayRangeOverride ?? `${low}-${high}`;
+
+      // For Glucose Random, some labs only print a single
+      // "< 140" normal range. To keep the UI consistent and
+      // clinically clearer, expand this into the full multi-tier
+      // range used elsewhere in the app.
+      const nameNorm = cleanName.toLowerCase();
+      if (/glucose\s+random/.test(nameNorm)) {
+        const approx = (x: number, y: number) => Math.abs(x - y) < 0.5;
+        if ((approx(l, 0) && approx(h, 140)) || (approx(l, 70) && approx(h, 140))) {
+          displayRange = "Hypoglycemia: <70; Normal: 70-140; Impaired Glucose: 140-199; Diabetes Mellitus: >=200";
+        }
+      }
+
+      parameters.push({
+        name: cleanName, value: v, unit: u,
+        rangeLow: l, rangeHigh: h, rangeUnit: ru,
+        status: classify(v, l, h),
+        rawValue: `${correctedVal}${u ? ' ' + u : ''}`,
+        rawRange: `${displayRange}${ru ? ' ' + ru : ''}`,
+      });
+    }
+
+    function parseMultiTierRange(rangeText: string): Array<{label: string; low: number; high: number}> | null {
+      const tiers: Array<{label: string; low: number; high: number}> = [];
+
+      // Fix hyphenated WORD splits like "Glu- cose" while leaving numeric
+      // ranges such as "140- 199" intact. Restrict to letters only.
+      let cleaned = rangeText.replace(/([A-Za-z])-+\s+([A-Za-z])/g, '$1$2');
+      cleaned = cleaned.replace(/\s+/g, ' ').trim();
+
+      cleaned = cleaned.replace(/\b(Deficiency|Insufficiency|Sufficiency|Severely\s+deficient)-(<?\d)/gi, '$1 $2');
+      cleaned = cleaned.replace(/\b(Deficiency|Insufficiency|Sufficiency|Severely\s+deficient)-(\d+(?:\.\d+)?)-(<?\d+(?:\.\d+)?)/gi, '$1 $2-$3');
+      cleaned = cleaned.replace(/(\d+(?:\.\d+)?)\s*-\s*<\s*(\d+(?:\.\d+)?)/g, '$1-$2');
+
+      cleaned = cleaned.replace(/\be\s*(\d+(?:\.\d+)?)\s*%/gi, '>= $1%');
+
+      // Normalize separators so each tier becomes its own part, even if the
+      // original text only put a "|" after the first category.
+      cleaned = cleaned.replace(/\s*\|\s*/g, ' | ');
+      cleaned = cleaned.replace(/\s+(Normal|Impaired|Diagnosing\s+Diabetes|Diabetes|Borderline|Desirable|Optimal|High|Low|At\s*Risk|Pre[\s-]?Diabet|Non-?diabetic|Deficiency|Insufficiency|Sufficiency|Severely\s+deficient)/gi, ' | $1');
+
+      console.log(`[ParseMultiTier-Debug] After normalization: "${cleaned}"`);
+
+      const parts = cleaned.split(/\|/).map(s => s.trim()).filter(Boolean);
+      console.log(`[ParseMultiTier-Debug] Split into ${parts.length} parts:`, parts);
+      if (parts.length < 2) return null;
+
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        console.log(`[ParseMultiTier-Debug] Processing part ${i}: "${part}"`);
+        
+        // Allow optional percent sign after numbers so patterns like
+        // "5.7%–6.4%" are correctly parsed.
+        const ltMatch = part.match(/^(.+?)\s*(?:less\s+than|<)\s*(\d+(?:\.\d+)?)\s*%?/i);
+        if (ltMatch) {
+          const tier = { label: ltMatch[1].replace(/\s*(?:adults?|>=?\s*\d+\s*years?)\s*/gi, ' ').trim(), low: 0, high: parseFloat(ltMatch[2]) };
+          console.log(`[ParseMultiTier-Debug] Matched LessThan pattern:`, tier);
+          tiers.push(tier);
+          continue;
+        }
+        const gtMatch = part.match(/^(.+?)\s*(?:>=?|greater\s+than)\s*=?\s*(\d+(?:\.\d+)?)\s*%?/i);
+        if (gtMatch) {
+          const tier = { label: gtMatch[1].replace(/\s*(?:adults?|>=?\s*\d+\s*years?)\s*/gi, ' ').trim(), low: parseFloat(gtMatch[2]), high: 99999 };
+          console.log(`[ParseMultiTier-Debug] Matched GreaterOrEqual pattern:`, tier);
+          tiers.push(tier);
+          continue;
+        }
+        const rangeMatch = part.match(/^(.+?)\s+(\d+(?:\.\d+)?)\s*%?\s*[-–]\s*(\d+(?:\.\d+)?)\s*%?/i);
+        if (rangeMatch) {
+          const tier = { label: rangeMatch[1].replace(/\s*(?:adults?|>=?\s*\d+\s*years?)\s*/gi, ' ').trim(), low: parseFloat(rangeMatch[2]), high: parseFloat(rangeMatch[3]) };
+          console.log(`[ParseMultiTier-Debug] Matched Range pattern:`, tier);
+          tiers.push(tier);
+          continue;
+        }
+        const rangeParenMatch = part.match(/^(.+?)\s*\((.+?)\)\s*(\d+(?:\.\d+)?)\s*%?\s*[-–]\s*(\d+(?:\.\d+)?)\s*%?/i);
+        if (rangeParenMatch) {
+          const tier = { label: `${rangeParenMatch[1].trim()} (${rangeParenMatch[2].trim()})`, low: parseFloat(rangeParenMatch[3]), high: parseFloat(rangeParenMatch[4]) };
+          console.log(`[ParseMultiTier-Debug] Matched Range-with-paren pattern:`, tier);
+          tiers.push(tier);
+          continue;
+        }
+        console.log(`[ParseMultiTier-Debug] No pattern matched for part ${i}`);
+      }
+
+      console.log(`[ParseMultiTier-Debug] Total tiers parsed: ${tiers.length}`);
+
+      if (parts.length < 2) return null;
+
+      for (let i = 0; i < tiers.length; i++) {
+        // Only back-fill a missing low bound when the previous tier has a
+        // finite upper bound. This keeps constructs like "Normal < 140"
+        // after "Hypoglycemia < 70" working, but avoids creating nonsense
+        // ranges after open-ended tiers like ">= 6.5".
+        if (tiers[i].low === 0 && i > 0 && tiers[i - 1].high !== 99999) {
+          tiers[i].low = tiers[i - 1].high;
+        }
+      }
+
+      return tiers;
+    }
+
+    function addMultiTierParam(name: string, val: string, rangeText: string, unit: string) {
+      const cleanName = name.replace(/[:;,]+$/, '').trim();
+      if (!cleanName || cleanName.length < 2) return false;
+
+      // Prefer an already-parsed value for this parameter (e.g. from a simple
+      // table row like "HbA1c (%)  7.9 %") so that multi-tier ranges do NOT
+      // overwrite the true observed value with a threshold like "5.7" from
+      // the reference range block.
+      const normName = cleanName.toLowerCase().replace(/[\s_]+/g, ' ').trim();
+      const existingIdx = parameters.findIndex(p =>
+        p.name.toLowerCase().replace(/[\s_]+/g, ' ').trim() === normName,
+      );
+
+      const hasExisting = existingIdx >= 0;
+      const existing = hasExisting ? parameters[existingIdx] : null;
+
+      const v = hasExisting ? existing!.value : parseFloat(val);
+      if (isNaN(v)) return false;
+
+      const tiers = parseMultiTierRange(rangeText);
+      if (!tiers || tiers.length === 0) return false;
+
+      console.log(`[MultiTier-Debug] Parsing "${cleanName}" with value=${v} ${unit}`);
+      console.log(`[MultiTier-Debug] Input rangeText: "${rangeText}"`);
+      console.log(`[MultiTier-Debug] Parsed tiers:`, tiers.map(t => `"${t.label}": ${t.low}-${t.high}`).join(', '));
+
+      // Find explicit tier match, but do NOT default to the first tier.
+      let matchedTier: { label: string; low: number; high: number } | null = null;
+      for (const tier of tiers) {
+        // Use strict < for upper bound when tier was parsed from "less than" statement
+        // This ensures "Less than 140" means v < 140, not v <= 140
+        if (v >= tier.low && v < tier.high) {
+          matchedTier = tier;
+          break;
+        }
+        if (tier.high === 99999 && v >= tier.low) {
+          matchedTier = tier;
+          break;
+        }
+      }
+
+      const normalTier = tiers.find(t => /normal|non-?diabetic|sufficiency(?!\s*-)|^sufficient/i.test(t.label) && !/insufficiency|insufficient|deficiency|deficient/i.test(t.label));
+      const normalLow = normalTier ? normalTier.low : tiers[0].low;
+      const normalHigh = normalTier ? normalTier.high : tiers[0].high;
+
+      // Determine status. If no tier matched (like value 156 with tiers
+      // [0-70, 70-140, >=200]), fall back to comparing against the normal range.
+      let status: "Normal" | "Low" | "High";
+      if (!matchedTier) {
+        if (v < normalLow) {
+          status = "Low";
+          matchedTier = { label: "Below normal", low: -Infinity, high: normalLow };
+        } else if (v > normalHigh) {
+          status = "High";
+          matchedTier = { label: "Above normal", low: normalHigh, high: Infinity };
+        } else {
+          status = "Normal";
+          matchedTier = normalTier || { label: "Normal range", low: normalLow, high: normalHigh };
+        }
+      } else {
+        const isNormalTier = /normal|optimal|adequate|(?:^|\b)sufficiency(?:\b|$)|(?:^|\b)sufficient(?:\b|$)|non-?diabetic/i.test(matchedTier.label) && !/insufficiency|insufficient|deficiency|deficient/i.test(matchedTier.label);
+        const isLowTier = /hypo|(?:^|\b)low(?:\b|$)|deficien|insufficien|severely\s+deficient/i.test(matchedTier.label);
+        
+        if (isNormalTier) {
+          status = "Normal";
+        } else if (isLowTier) {
+          status = "Low";
+        } else {
+          // Covers Impaired, High, Elevated, Diabetes, Borderline, At Risk, etc.
+          status = "High";
+        }
+      }
+
+      const u = (unit || (existing?.unit ?? '')).trim();
+
+      // Build FULL reference range string including all tiers
+      const allTierDisplay = tiers.map(t => {
+        let part = t.label;
+        if (t.high === 99999) {
+          part += ` >= ${t.low}`;
+        } else if (t.low === 0) {
+          part += ` Less than ${t.high}`;
+        } else {
+          part += ` ${t.low}-${t.high}`;
+        }
+        return part;
+      }).join('; ');
+
+      const rawValue = hasExisting && existing
+        ? existing.rawValue
+        : `${val}${u ? ' ' + u : ''}`;
+
+      const updatedParam: ParsedParameter = {
+        name: cleanName, value: v, unit: u,
+        rangeLow: normalLow, rangeHigh: normalHigh, rangeUnit: u,
+        status: status,
+        rawValue,
+        rawRange: `${allTierDisplay}${u ? ' ' + u : ''}`,
+        matchedTier: matchedTier ? matchedTier.label : undefined,
+      };
+
+      if (hasExisting && existingIdx >= 0) {
+        parameters[existingIdx] = updatedParam;
+      } else {
+        parameters.push(updatedParam);
+      }
+
+      console.log(`[MultiTier] ${cleanName}: value=${v}, matchedTier="${matchedTier.label}" [${matchedTier.low}-${matchedTier.high}${matchedTier.high === 99999 ? '+' : ''}], normalRange=${normalLow}-${normalHigh}, status=${status}`);
+      return true;
+    }
+
+    let inNarrativeSection = false;
+
+    for (let currentLineIdx = 0; currentLineIdx < lines.length; currentLineIdx++) {
+      const line = lines[currentLineIdx];
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.length < 5) continue;
+
+      if (/^(Interpretation|Comments\s*:|Disclaimer\s*:|--\s*End\s+Of\s+Report|[•\-]\s*(Comments|Disclaimer|Clinical\s+Use|Increased\s+Levels|Decreased\s+Levels|References)\s*:)/i.test(trimmed)) {
+        inNarrativeSection = true;
+        continue;
+      }
+
+      if (/^[•\-]?\s*(Sample\s+Type|Method)\s*:/i.test(trimmed)) {
+        inNarrativeSection = true;
+        continue;
+      }
+
+      if (/^\s*Since\s+HbA1c\s+reflects/i.test(trimmed)) {
+        inNarrativeSection = true;
+        continue;
+      }
+
+      if (/^(Reference\s+Ranges?\s+for|Definition\s+of\s+HbA1c|Parameter\s+Reference\s+Range\s+Clinical)/i.test(trimmed)) {
+        inNarrativeSection = true;
+        continue;
+      }
+
+      if (/^(Associated\s+Tests?\s*:|Pediatric\s+HbA1c)/i.test(trimmed)) {
+        inNarrativeSection = true;
+        continue;
+      }
+
+      if (inNarrativeSection) {
+        const DATA_LINE_RE = /\b\d+(\.\d+)?\s*(mg\/d[lL]|mg\/g|g\/d[lL]|IU\/L|U\/L|uIU\/mL|mmol\/L|µmol\/L|ng\/mL|ng\/d[lL]|pg\/mL|mEq\/L|%|lakhs|million|cumm|cells\/cumm|thou\/uL|mill\/uL|fL|g%|gm\/dL|gm\/dl|sec|mm\/hr|ug\/[lL]|µg\/[lL]|IU\/mL|mIU\/mL|U\/mL|mg\/L|g\/L)\b/i;
+        if (/^--\s*\d+\s+of\s+\d+\s*--/i.test(trimmed) || /^(Units\s|Investigation\s|Result\s|Test\s+Name)/i.test(trimmed) || (/^Parameter\s/i.test(trimmed) && !/Reference\s+Range\s+Clinical/i.test(trimmed))) {
+          inNarrativeSection = false;
+        } else if (DATA_LINE_RE.test(trimmed) && /^[A-Z][a-zA-Z\s()\/\-]+\s+\d/.test(trimmed)) {
+          inNarrativeSection = false;
+        } else {
+          continue;
+        }
+      }
+
+      if (metadataExact.test(trimmed)) continue;
+      if (/^[-=_*#]{3,}$/.test(trimmed)) continue;
+
+      // Debug: log lines that mention Glucose
+      if (/glucose/i.test(trimmed)) {
+        console.log(`[Debug-Glucose] Processing line: "${trimmed.substring(0, 120)}..."`);
+      }
+
+      let matched = false;
+
+      // P5: Multi-tier reference ranges - CHECK THIS FIRST before simple patterns
+      // detect lines containing tier keywords like Hypoglycemia, Impaired, Diabetes
+      if (!matched) {
+        const TIER_KW = /\b(?:Hypoglyc|Impaired|Diabetes\s+mellitus|Borderline|Desirable|Pre[\s-]?Diabet|Non-?diabetic|Diagnosing|At\s*Risk|Deficien|Insufficien|Sufficien|Severely)/i;
+        const RANGE_KW = /(?:\bless\s+than|<|>=|>\s*=|\b\d+\s*[-–]\s*\d+)/i;
+        const hasTierKeywords = TIER_KW.test(trimmed) && RANGE_KW.test(trimmed);
+        if (hasTierKeywords) {
+          const UNIT_RE = /(?:mg\/d[lL]|mg[l1]d[lL]|g\/d[lL]|IU\/L|U\/L|uIU\/mL|mmol\/L|µmol\/L|ng\/mL|ng\/d[lL]|pg\/mL|mEq\/L|%|lakhs|million|cumm)/i;
+          const valInLine = trimmed.match(new RegExp(`\\b(\\d+[\\d.,]*)\\s*(${UNIT_RE.source})`, 'i'));
+
+          if (valInLine) {
+            const val = valInLine[1].replace(',', '.');
+            const unit = valInLine[2].replace(/[l1]d/i, '/d');
+
+            let tierText = trimmed
+              .replace(new RegExp(`\\b${valInLine[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*${valInLine[2].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i'), ' ')
+              .replace(/\s+/g, ' ').trim();
+
+            tierText = tierText.replace(/^.*?(?:Reference\s+Range|Bio\.?\s*Ref\.?\s*Inter-?\s*val)\s*/i, '').trim();
+
+            const TIER_START_RE = /^(?:Hypoglyc|Non-?diabetic|Normal\s+(?:Less|<)|Low\s+(?:Less|<)|High\s|Optimal|Borderline|Desirable|At\s*Risk|Pre[\s-]?Diabet|Diagnosing|Deficien|Insufficien|Sufficien|Severely)/i;
+            const startsWithTier = TIER_START_RE.test(tierText);
+
+            let paramName = '';
+            let rangeText = '';
+
+            if (startsWithTier) {
+              rangeText = tierText;
+              
+              // Scan ahead for ALL tier keywords that might be on following lines
+              const lineIdx = currentLineIdx;
+              for (let j = lineIdx + 1; j < Math.min(lineIdx + 8, lines.length); j++) {
+                const nextLine = lines[j].trim();
+                if (!nextLine) continue;
+                if (metadataExact.test(nextLine)) break;
+                if (/^[-=_*#]{3,}$/.test(nextLine)) break;
+                
+                // Check if line contains tier keywords or ranges
+                const hasTierKeyword = /(?:Hypoglyc|Normal|Impaired|Diabetes|Borderline|Desirable|Optimal|High\s+Risk|Low\s+Risk|At\s*Risk|Pre[\s-]?Diabet|Non-?diabetic|Diagnosing|Therapeutic|For\s+Age|Deficien|Insufficien|Sufficien|Severely)/i.test(nextLine);
+                const hasRange = /(?:Less\s+than|^than\s+\d+|<|>=?|>\s*=?)\s*\d+|\d+\s*[-–]\s*\d+/i.test(nextLine);
+                
+                if (hasTierKeyword || hasRange) {
+                  rangeText += ' ' + nextLine;
+                  continue;
+                }
+                
+                if (/^(Conditions|Associated|Clinical|Interpretation|Reference|Method|Caution|Disclaimer|Note:|Specifications)/i.test(nextLine)) {
+                  break;
+                }
+              }
+              if (lineIdx > 0) {
+                for (let back = lineIdx - 1; back >= Math.max(0, lineIdx - 5); back--) {
+                  const prevLine = lines[back].trim();
+                  if (!prevLine) continue;
+                  if (metadataExact.test(prevLine)) continue;
+                  if (/^[-=_*#]{3,}$/.test(prevLine)) continue;
+                  if (/^(Parameter\s+Name|Observed\s+Value|Reference\s+Range|Test\s+Name|Investigation|Bio\.?\s*Ref)/i.test(prevLine)) continue;
+                  if (/^\[?\d+\s+Test/i.test(prevLine)) continue;
+                  if (/Test\(s\)\s+Out\s+of/i.test(prevLine)) continue;
+
+                  const cleanPrev = prevLine
+                    .replace(/,?\s*(?:Fluoride\s+Plasma|Serum|Whole\s+Blood|Plasma|Urine)\s*(?:\(.*?\))?/gi, '')
+                    .replace(/\(.*?(?:Chemistry|Hematology|Immunology).*?\)/gi, '')
+                    .trim();
+
+                  if (cleanPrev && cleanPrev.length >= 3 && /[a-zA-Z]/.test(cleanPrev)) {
+                    paramName = cleanPrev;
+                    break;
+                  }
+                }
+              }
+            } else {
+              const nameMatch = tierText.match(/^(.+?)(?=\s+(?:Hypoglyc|Non-?diabetic|Normal|Low|High|Optimal|Borderline|Desirable|At\s*Risk|Pre[\s-]?Diabet|Diagnosing|Deficien|Insufficien|Sufficien|Severely))/i);
+              paramName = nameMatch ? nameMatch[1].trim().replace(/[,;]+$/, '') : '';
+
+              const tierStartIdx = nameMatch ? tierText.indexOf(nameMatch[0]) + nameMatch[0].length : 0;
+              rangeText = tierText.substring(tierStartIdx).trim();
+
+              const lineIdx = currentLineIdx;
+              for (let j = lineIdx + 1; j < Math.min(lineIdx + 12, lines.length); j++) {
+                const nextLine = lines[j].trim();
+                if (!nextLine) continue;
+                if (metadataExact.test(nextLine)) break;
+                if (/^[-=_*#]{3,}$/.test(nextLine)) break;
+                if (/^(Biological\s+Ref|Reference\s+(Range|Interval)|Bio\.?\s*Ref|Normal\s+Range|Ref\.?\s*Range)/i.test(nextLine)) continue;
+                if (/^(Sample\s+Type|Method\s*:|Instrument|Caution|Disclaimer|Note:|Interpretation)/i.test(nextLine)) break;
+                if (/^(Detailed|Summary|Page|Powered|End\s+of|Conditions\s+for|Comments)/i.test(nextLine)) break;
+
+                const hasTierKeyword = /(?:Hypoglyc|Normal|Impaired|Diabetes|Borderline|Desirable|Optimal|High\s+Risk|Low\s+Risk|At\s*Risk|Pre[\s-]?Diabet|Non-?diabetic|Diagnosing|Therapeutic|For\s+Age|Deficien|Insufficien|Sufficien|Severely)/i.test(nextLine);
+                const hasRange = /(?:Less\s+than|^than\s+\d+|<|>=?|>\s*=?)\s*\d+|\d+\s*[-–]\s*\d+/i.test(nextLine);
+
+                if (hasTierKeyword || hasRange) {
+                  rangeText += ' ' + nextLine;
+                  continue;
+                }
+                break;
+              }
+            }
+
+            if (paramName && paramName.length >= 2 && rangeText.length > 10) {
+              const tierSep = rangeText.includes('|') ? rangeText : rangeText
+                .replace(/\s+(Normal|Impaired|Diagnosing\s+Diabetes|Diabetes|Borderline|Desirable|Optimal|High|Low|At\s*Risk|Pre[\s-]?Diabet|Non-?diabetic|Deficiency|Insufficiency|Sufficiency|Severely\s+deficient)/gi, ' | $1');
+
+              matched = addMultiTierParam(paramName, val, tierSep, unit);
+              if (matched) {
+                console.log(`[P5-MultiTier] name="${paramName}", extracted from: "${trimmed.substring(0, 80)}..."`);
+              } else {
+                console.log(`[P5-Failed] paramName="${paramName}", rangeText="${rangeText.substring(0, 60)}...", val=${val}, unit=${unit}`);
+              }
+            } else {
+              console.log(`[P5-Skip] Invalid paramName or rangeText. paramName="${paramName}" (len=${paramName?.length || 0}), rangeText="${rangeText.substring(0, 40)}..." (len=${rangeText?.length || 0})`);
+            }
+          } else {
+            console.log(`[P5-NoValue] Line contains tier keywords but no value match: "${trimmed.substring(0, 80)}..."`);
+          }
+        }
+      }
+
+      // P6: Multi-tier on following lines - scan ahead for pipe-separated tiers
+      if (!matched) {
+        const valueOnlyMatch = trimmed.match(
+          /^(.+?)\s+([\d.,]+)\s*(mg\/d[lL]|mg\/g|g\/d[lL]|gm\/d[lL]|g%|IU\/L|U\/L|uIU\/mL|mmol\/L|µmol\/L|ng\/mL|ng\/d[lL]|pg\/mL|mEq\/L|%|lakhs|million|cumm|cells\/cumm|thou\/uL|mill\/uL|fL|sec|mm\/hr|ug\/[lL]|µg\/[lL]|IU\/mL|mIU\/mL|U\/mL|mg\/L|g\/L)\s*$/i
+        );
+        if (valueOnlyMatch) {
+          const [, name, val, unit] = valueOnlyMatch;
+          const lineIdx = currentLineIdx;
+          if (lineIdx >= 0) {
+            let rangeText = "";
+            let skippedHeaders = 0;
+            for (let j = lineIdx + 1; j < Math.min(lineIdx + 12, lines.length); j++) {
+              const nextLine = lines[j].trim();
+              if (!nextLine) continue;
+              if (metadataExact.test(nextLine)) break;
+              if (/^[-=_*#]{3,}$/.test(nextLine)) break;
+              if (/^(Detailed|Summary|Page|Powered|End\s+of|Conditions\s+for)/i.test(nextLine)) break;
+              if (/^(Sample\s+Type|Method\s*:|Instrument|Caution|Disclaimer|Note:)/i.test(nextLine)) break;
+              if (/^(Biological\s+Ref|Reference\s+(Range|Interval)|Bio\.?\s*Ref|Normal\s+Range|Ref\.?\s*Range|Investigation|Result|Units)/i.test(nextLine)) {
+                skippedHeaders++;
+                continue;
+              }
+              if (/\b(?:less\s+than|>=|>?\s*=|<\s*\d|hypoglyc|non-?diabetic|diabetic|normal|impaired|diabetes|borderline|desirable|optimal|at\s*risk|pre[\s-]?diabet|diagnosing|therapeutic|for\s+age|deficien|insufficien|sufficien|severely)/i.test(nextLine)) {
+                rangeText += (rangeText ? " " : "") + nextLine;
+              } else if (!rangeText && skippedHeaders < 3) {
+                continue;
+              } else {
+                break;
+              }
+            }
+            if (rangeText && (rangeText.includes('|') || (/(?:less\s+than|<\s*\d)/i.test(rangeText) && /(?:Impaired|Diabetes|Borderline|Desirable|Pre[\s-]?Diabet|At\s*Risk|Diagnosing|Insufficien|Sufficien)/i.test(rangeText)) || (/non-?diabetic/i.test(rangeText) && /(?:diabetes|pre[\s-]?diabet|at\s*risk|diagnosing)/i.test(rangeText)) || (/deficien/i.test(rangeText) && /(?:insufficien|sufficien)/i.test(rangeText)))) {
+              const tierSep = rangeText.includes('|') ? rangeText : rangeText
+                .replace(/\s+(Normal|Impaired|Diabetes|Diagnosing\s+Diabetes|Borderline|Desirable|Optimal|High|Low|At\s*Risk|Pre[\s-]?Diabet|Non-?diabetic|Deficiency|Insufficiency|Sufficiency|Severely\s+deficient)/gi, ' | $1');
+              console.log(`[P6-Try] name="${name}", val=${val}, unit=${unit}, rangeText="${rangeText.substring(0, 100)}..."`);
+              matched = addMultiTierParam(name, val.replace(',', '.'), tierSep, unit);
+              if (matched) {
+                console.log(`[P6-MultiTier] Successfully matched "${name}"`);
+              }
+            } else if (!rangeText) {
+              const cleanName = name.replace(/[:;,]+$/, '').trim();
+              if (cleanName && cleanName.length >= 3 && !/^(page|processed|powered|please|scan|dr\b|disclaimer|sample|method)/i.test(cleanName)) {
+                const v = parseFloat(val.replace(',', '.'));
+                if (!isNaN(v)) {
+                  parameters.push({
+                    name: cleanName, value: v, unit: unit.trim(),
+                    rangeLow: 0, rangeHigh: 0, rangeUnit: unit.trim(),
+                    status: "Normal" as const,
+                    rawValue: `${val} ${unit}`.trim(),
+                    rawRange: "Not specified",
+                  });
+                  matched = true;
+                  console.log(`[P6-NoRange] Added "${cleanName}" = ${val} ${unit} (no reference range in report)`);
+                }
+              }
+            } else {
+              console.log(`[P6-Skip] Found rangeText but no tier keywords: "${(rangeText || '').substring(0, 40)}..."`);
+            }
+          }
+        }
+      }
+
+      // P1: "Name  Value Unit  Low-High Unit" (most common simple pattern)
+      if (!matched) {
+        const p1 = trimmed.match(new RegExp(
+          `^(.+?)\\s+([\\d.,]+)\\s*(${UNIT_PAT})?\\s+(\\.?\\d[\\d.,]*)\\s*(?:${RANGE_SEP})\\s*(\\.?\\d[\\d.,]*)\\s*(${UNIT_PAT})?`, 'i'
+        ));
+        if (p1) {
+          const [, name, val, unit, low, high, rangeUnit] = p1;
+          addParam(name, val.replace(',', '.'), low.replace(',', '.'), high.replace(',', '.'), unit || '', rangeUnit);
+          if (parameters.length > 0 && parameters[parameters.length - 1].name === name.replace(/[:;,]+$/, '').trim()) matched = true;
+        }
+      }
+
+      // P2: "Name: Value (Low - High) Unit" or "Name: Value (Low-High)"
+      if (!matched) {
+        const p2 = trimmed.match(new RegExp(
+          `^(.+?)\\s*:\\s*([\\d.,]+)\\s*(${UNIT_PAT})?\\s*[\\(\\[]\\s*(\\.?\\d[\\d.,]*)\\s*(?:${RANGE_SEP})\\s*(\\.?\\d[\\d.,]*)\\s*(${UNIT_PAT})?\\s*[\\)\\]]`, 'i'
+        ));
+        if (p2) {
+          const [, name, val, unit, low, high, rangeUnit] = p2;
+          addParam(name, val.replace(',', '.'), low.replace(',', '.'), high.replace(',', '.'), unit || '', rangeUnit);
+          matched = true;
+        }
+      }
+
+      if (!matched) {
+        const p2b = trimmed.match(new RegExp(
+          `^(.+?)\\s+([\\d.,]+)\\s*[\\(\\[]\\s*(\\.?\\d[\\d.,]*)\\s*(?:${RANGE_SEP})\\s*(\\.?\\d[\\d.,]*)\\s*(${UNIT_PAT})?\\s*[\\)\\]]`, 'i'
+        ));
+        if (p2b) {
+          const [, name, val, low, high, unit] = p2b;
+          addParam(name, val.replace(',', '.'), low.replace(',', '.'), high.replace(',', '.'), unit || '');
+          matched = true;
+        }
+      }
+
+      // P3: "Name  Value  Low-High" (no unit or unit at end of line)
+      if (!matched) {
+        const p3 = trimmed.match(new RegExp(
+          `^(.+?)\\s+([\\d.,]+)\\s+(\\.?\\d[\\d.,]*)\\s*(?:${RANGE_SEP})\\s*(\\.?\\d[\\d.,]*)\\s*(${UNIT_PAT})?\\s*$`, 'i'
+        ));
+        if (p3) {
+          const [, name, val, low, high, unit] = p3;
+          addParam(name, val.replace(',', '.'), low.replace(',', '.'), high.replace(',', '.'), unit || '');
+          matched = true;
+        }
+      }
+
+      // P3b: "Name  Value Unit  < High Unit" or "Name  Value Unit  >= Low Unit"
+      // Handles one-sided reference ranges like "<140 mg/dL" commonly used for PP glucose.
+      if (!matched) {
+        const p3bLt = trimmed.match(new RegExp(
+          `^(.+?)\\s+([\\d.,]+)\\s*(${UNIT_PAT})?\\s*(?:<|less\\s+than)\\s*(\\.?\\d[\\d.,]*)\\s*(${UNIT_PAT})?\\s*$`,
+          'i'
+        ));
+        if (p3bLt) {
+          const [, name, val, unit, high, rangeUnit] = p3bLt;
+          addParam(
+            name,
+            val.replace(',', '.'),
+            "0",
+            high.replace(',', '.'),
+            unit || '',
+            rangeUnit,
+            `<${high.replace(',', '.')}`
+          );
+          matched = true;
+        }
+      }
+
+      if (!matched) {
+        const p3bGt = trimmed.match(new RegExp(
+          `^(.+?)\\s+([\\d.,]+)\\s*(${UNIT_PAT})?\\s*(?:>=?|greater\\s+than)\\s*=?\\s*(\\.?\\d[\\d.,]*)\\s*(${UNIT_PAT})?\\s*$`,
+          'i'
+        ));
+        if (p3bGt) {
+          const [, name, val, unit, low, rangeUnit] = p3bGt;
+          addParam(
+            name,
+            val.replace(',', '.'),
+            low.replace(',', '.'),
+            "99999",
+            unit || '',
+            rangeUnit,
+            `>=${low.replace(',', '.')}`
+          );
+          matched = true;
+        }
+      }
+
+      // P4: "Name: Value Unit  Ref: Low-High Unit" or "Name: Value Unit  Reference: Low-High"
+      if (!matched) {
+        const p4 = trimmed.match(new RegExp(
+          `^(.+?)\\s*:\\s*([\\d.,]+)\\s*(${UNIT_PAT})?\\s*(?:ref(?:erence)?\\s*(?:range)?\\s*[:=]?|normal\\s*(?:range)?\\s*[:=]?)\\s*(\\.?\\d[\\d.,]*)\\s*(?:${RANGE_SEP})\\s*(\\.?\\d[\\d.,]*)\\s*(${UNIT_PAT})?`, 'i'
+        ));
+        if (p4) {
+          const [, name, val, unit, low, high, rangeUnit] = p4;
+          addParam(name, val.replace(',', '.'), low.replace(',', '.'), high.replace(',', '.'), unit || '', rangeUnit);
+          matched = true;
+        }
+      }
+    }
+
+    // Fallback: handle Glucose Random multi-tier patterns that may be missed above,
+    // especially from certain lab report layouts.
+    if (parameters.length === 0) {
+      const glucoseRandomRe = /Glucose\s+Random[^\d]*(\d[\d.,]*)\s*mg\/d[lL][\s\S]*?(Hypoglycemia[\s\S]*?Diabetes\s+melli-?tus\s*>=\s*\d[\d.,]*)/i;
+      const m = normalized.match(glucoseRandomRe);
+      if (m) {
+        const valueStr = m[1].replace(',', '.');
+        const rangeBlock = m[2];
+        const compactRange = rangeBlock.replace(/\s+/g, ' ');
+        addMultiTierParam("Glucose Random", valueStr, compactRange, "mg/dL");
+      }
+    }
+
+    // Special patch for HbA1c: use the true observed value from the
+    // narrative line (e.g. "HbA1c ... 5.4 %") and, for labs that
+    // express the normal range as "Non-diabetic: <5.7%", treat any
+    // value below that upper cut-off as Normal (not Low).
+    (function patchHbA1cValue() {
+      const idx = parameters.findIndex((p) => /hba1c/i.test(p.name));
+      if (idx === -1) return;
+
+      const match = normalized.match(/HbA1c[^0-9]{0,80}?(\d+(?:\.\d+)?)\s*%/i);
+      if (!match) return;
+
+      const observedStr = match[1];
+      const observedVal = parseFloat(observedStr);
+      if (isNaN(observedVal)) return;
+
+      const current = parameters[idx];
+
+      // Start from whatever range the generic parser inferred, but
+      // try to refine it using the lab's textual reference for
+      // HbA1c (e.g. "Non-diabetic: <5.7%, Pre-diabetic: 5.7-6.5%...").
+      let low = current.rangeLow;
+      let high = current.rangeHigh;
+
+      const upperCandidates: number[] = [];
+
+      // Pattern 1: "Non-diabetic : < 5.7%"
+      const nonDiabeticMatch = normalized.match(/Non-?diabetic\s*[:\-]\s*<\s*(\d+(?:\.\d+)?)\s*%/i);
+      if (nonDiabeticMatch) {
+        const v = parseFloat(nonDiabeticMatch[1]);
+        if (!isNaN(v)) upperCandidates.push(v);
+      }
+
+      // Pattern 2: standalone "< 5.7 , Pre-diabetic: 5.7 - 6.5" (percent sign may be missing)
+      const ltWithPreDiab = normalized.match(/<\s*(\d+(?:\.\d+)?)\s*%?\s*,?\s*Pre-?diabet/i);
+      if (ltWithPreDiab) {
+        const v = parseFloat(ltWithPreDiab[1]);
+        if (!isNaN(v)) upperCandidates.push(v);
+      }
+
+      let inferredUpper = upperCandidates
+        .filter(v => v > 0 && v < 20)
+        .sort((a, b) => a - b)[0];
+
+      // Heuristic fallback: if the parsed "normal" tier is something
+      // like 5.7–6.4, treat the lower bound (5.7) as the non-diabetic
+      // cut-off "<5.7" when we couldn't read it explicitly from text.
+      if (!inferredUpper) {
+        if (
+          current.rangeLow > 0 &&
+          current.rangeLow < 10 &&
+          current.rangeHigh > current.rangeLow &&
+          current.rangeHigh - current.rangeLow <= 2
+        ) {
+          inferredUpper = current.rangeLow;
+        }
+      }
+
+      if (inferredUpper) {
+        low = 0;
+        high = inferredUpper;
+      }
+
+      // If the inferred / existing range still looks invalid, fall
+      // back to a conservative canonical non-diabetic range.
+      if (!isFinite(low) || !isFinite(high) || low >= high || high > 20) {
+        low = 0;
+        high = 5.7;
+      }
+
+      let status: "Normal" | "Low" | "High";
+      if (observedVal < low) status = "Low";
+      else if (observedVal > high) status = "High";
+      else status = "Normal";
+
+      parameters[idx] = {
+        ...current,
+        value: observedVal,
+        rangeLow: low,
+        rangeHigh: high,
+        status,
+        rawValue: `${observedStr} %`,
+      };
+
+      console.log(`[HbA1c-Fix] Corrected value for "${current.name}": ${current.value} -> ${observedVal} (range ${low}-${high}, status=${status})`);
+    })();
+
+    // Deduplicate: use name + unit to distinguish variants like Bilirubin Total vs Bilirubin Direct
+    const seen = new Map<string, ParsedParameter>();
+    for (const p of parameters) {
+      const key = p.name.toLowerCase().replace(/[\s_]+/g, ' ').trim();
+      if (key.length >= 2) {
+        seen.set(key, p);
+      }
+    }
+    const result = Array.from(seen.values());
+    console.log(`[Parser-Final] Total parameters parsed: ${result.length}`);
+    result.forEach(p => {
+      console.log(`  - ${p.name}: ${p.value} ${p.unit} (range: ${p.rawRange})`);
+    });
+    return result;
+  }
+
+  function buildPreClassifiedTable(params: ParsedParameter[]): string {
+    if (params.length === 0) return "";
+    let table = "PRE-CLASSIFIED PARAMETER TABLE (Status determined by code, NOT by you):\n";
+    table += "| Parameter | Value (with Unit) | Reference Range (with Unit) | Status (LOCKED) | Matched Tier |\n";
+    table += "|-----------|-------------------|-----------------------------|-----------------|--------------|\n";
+    for (const p of params) {
+      const tierInfo = p.matchedTier ? p.matchedTier : "—";
+      if (p.rawRange === "Not specified") {
+        table += `| ${p.name} | ${p.rawValue} | Not specified in report | USE YOUR MEDICAL KNOWLEDGE | ${tierInfo} |\n`;
+      } else {
+        table += `| ${p.name} | ${p.rawValue} | ${p.rawRange} | ${p.status} | ${tierInfo} |\n`;
+      }
+    }
+    return table;
+  }
+
+  app.post(api.reports.analyze.path, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const { userId } = api.reports.analyze.input.parse(req.body);
+
+      const report = await storage.getMedicalReport(id);
+      if (!report) {
+        return res.status(404).json({ message: "Report not found" });
+      }
+
+      const MODEL_BASE_URL = "http://43.230.202.219:5000";
+
+      // HYBRID CLINICAL AI: Parse and classify parameters deterministically
+      const classifiedParams = parseAndClassifyParameters(report.reportText || "");
+      const preClassifiedTable = buildPreClassifiedTable(classifiedParams);
+      const hasClassifiedParams = classifiedParams.length > 0;
+
+      console.log(`[Hybrid AI] Parsed ${classifiedParams.length} parameters from report #${id}`);
+      if (hasClassifiedParams) {
+        classifiedParams.forEach(p => {
+          console.log(`  ${p.name}: ${p.value} ${p.unit} (range: ${p.rangeLow}-${p.rangeHigh}) → ${p.status}`);
+        });
+      } else {
+        console.log(`  [Hybrid AI] No parameters parsed from report text, falling back to LLM classification`);
+      }
+
+      // Create analysis prompt
+      const analysisPrompt = `Analyze this medical report and provide a detailed interpretation.
+
+MOST CRITICAL RULE — NO HALLUCINATION:
+- You MUST ONLY include parameters that are EXPLICITLY present in the report text below.
+- Do NOT invent, assume, or add any lab parameters that are NOT in the report.
+- NEVER add parameters like SGOT, SGPT, ALP, Hemoglobin, etc. unless they appear in the actual report text.
+- If you are unsure whether a parameter exists in the report, do NOT include it.
+- NEVER add "recommended tests" or parameters that the patient "should get tested" into the parameter table. The table is ONLY for results that are actually present in the report.
+
+COMPLETENESS RULE — DO NOT MISS ANY PARAMETER:
+- Carefully scan the ENTIRE report text for ALL lab test results with numeric values.
+- Your final table must include EVERY parameter that has a numeric result in the report — do NOT skip any.
+- If a pre-classified table is provided below, it may not contain ALL parameters. You MUST ALSO independently scan the report text and add any parameters that the pre-classified table missed.
+- For any parameters you find in the report text that are NOT in the pre-classified table, classify them yourself using your medical knowledge and the reference ranges from the report.
+- Count ALL distinct test parameters in the report text first, then verify your output table has at least that many rows.
+
+MULTI-TIER REFERENCE RANGES:
+- Some parameters have MULTIPLE reference categories in the report text (e.g., "Hypoglycemia Less than 70 | Normal 70–99 | Impaired Glucose 100–125 | Diabetes mellitus >= 126").
+- For such parameters, output ONLY ONE ROW in the table — NOT one row per category.
+- In the "Reference Range (with Unit)" column, you MUST display the FULL overall reference range for that parameter, including **all** tiers/categories in a single cell. Separate tiers with commas or semicolons — NOT with additional "|" characters. For example: "Hypoglycemia: <70 mg/dL; Normal: 70–99 mg/dL; Impaired Glucose: 100–125 mg/dL; Diabetes mellitus: >=126 mg/dL".
+- Use the Status and Explanation columns to indicate which tier the patient's value actually falls into; do NOT hide the other tiers by showing only one category in the Reference Range column.
+- NEVER create multiple rows for the same parameter just because it has multiple reference categories.
+
+${hasClassifiedParams ? `
+=== HYBRID CLINICAL AI MODE ===
+The system has ALREADY classified the status of each parameter using deterministic code:
+  if value > upper_bound: "High"
+  elif value < lower_bound: "Low"
+  else: "Normal"
+
+These statuses are 100% mathematically correct and MUST NOT be changed.
+
+${preClassifiedTable}
+
+ABSOLUTE RULES FOR STATUS:
+1. You MUST use the EXACT status from the pre-classified table above. Do NOT override, change, or re-interpret any status.
+2. If the pre-classified table says "Normal", you MUST write "Normal" in your output — even if the value seems close to a boundary.
+3. If the pre-classified table says "High", you MUST write "High" — do not downgrade it.
+4. If the pre-classified table says "Low", you MUST write "Low" — do not upgrade it.
+5. You may add "Elevated" as a display alias for "High" or "Deficient" as an alias for "Low", but the base classification MUST match.
+6. SAFETY NET: The pre-classified table may NOT contain ALL parameters from the report. You MUST independently scan the full report text for ANY parameters with numeric values that are NOT in the pre-classified table. If you find any, ADD them to your output table and classify them yourself using: value < lower = Low, value > upper = High, else Normal. Use reference ranges from the report text, or if none are provided, use standard medical reference ranges from your knowledge.
+7. If a parameter has status "USE YOUR MEDICAL KNOWLEDGE" (no reference range in the report), you MUST classify it using your medical knowledge. For example, Mean Blood Glucose is a calculated value from HbA1c — use standard medical reference ranges to determine its status. You MUST still include this parameter in the final table with an appropriate status and explain the reference range you used.
+8. MATCHED TIER: For multi-tier parameters (e.g., Vitamin D with Deficiency/Insufficiency/Sufficiency tiers), the "Matched Tier" column tells you EXACTLY which tier the patient's value falls into. You MUST use this matched tier name in your explanation text. For example, if Matched Tier says "Deficiency", you MUST say "deficiency" in your explanation — do NOT say "insufficiency" or any other tier name. The matched tier is mathematically determined and cannot be wrong.
+
+ABSOLUTE RULES FOR REFERENCE RANGE (WITH UNIT) IN HYBRID MODE:
+1. For every parameter that appears in the pre-classified table above, you MUST COPY the "Reference Range (with Unit)" cell **EXACTLY AS-IS** into your final markdown table — do NOT drop, reorder, summarize, or rephrase any part of it.
+2. If the pre-classified table shows multiple tiers (e.g., "Hypoglycemia Less than 70; Normal 70–140; Impaired Glucose 140–199; Diabetes mellitus >= 200 mg/dL"), your final table MUST show **all of those tiers in the Reference Range (with Unit) column**, exactly in the same order.
+3. You are NOT allowed to omit intermediate tiers like "Impaired Glucose" or merge them into other text. The reference range column is a direct echo of the pre-classified table value.
+4. You may only adjust wording in the Status / Explanation / Risks columns. The Reference Range column must remain a faithful copy of the deterministic code output.
+=== END HYBRID MODE ===
+` : `
+STATUS CLASSIFICATION RULES (fallback when code parser cannot extract values):
+- For EVERY parameter, determine status using ONLY this algorithm:
+  Step 1: Extract numeric value V, lower bound L, upper bound U.
+  Step 2: If V >= L AND V <= U then Status = "Normal"
+  Step 3: If V < L then Status = "Low"
+  Step 4: If V > U then Status = "High"
+- A value INSIDE the range is ALWAYS "Normal", even if near the boundary.
+- Do NOT use subjective judgment like "borderline" to change the status.
+`}
+
+FORMATTING GUIDELINES:
+1. If the report contains structured lab values (like blood tests), use a MARKDOWN TABLE with columns: | Parameter | Value (with Unit) | Reference Range (with Unit) | Status | Explanation | Risks |
+   - Output the header row and separator ONLY ONCE. Do NOT repeat the header row as a data row. The first data row must contain actual lab values, NOT column names.
+2. CRITICAL — KEEP VALUE AND REFERENCE RANGE IN SEPARATE COLUMNS:
+   - The "Value (with Unit)" column must contain ONLY the patient's test result value and its unit (e.g., "5.6 mg/dl", "205 IU/L", "12.5 g/dL"). This cell MUST NEVER be empty.
+   - The "Reference Range (with Unit)" column must contain ONLY the normal reference range with unit (e.g., "0.2-1.2 mg/dl", "5-45 IU/L", "12-17 g/dL").
+   - NEVER combine or merge value and reference range into the same cell. They must be in their own separate columns.
+   - EXAMPLE CORRECT ROW: | Bilirubin_T | 5.6 mg/dl | 0.2-1.2 mg/dl | Elevated | ... | ... |
+   - EXAMPLE WRONG ROW: | Bilirubin_T | 5.6 .2-1.2mg/dl | ... | ... | ... | ... | ← DO NOT DO THIS
+   - EXAMPLE WRONG ROW: | Bilirubin_T |  | 0.2-1.2 mg/dl | ... | ... | ... | ← Value cell is EMPTY — DO NOT DO THIS
+3. Always include measurement UNITS alongside both value AND reference range. Never show values or ranges without units.
+4. If the report is a general summary or doesn't fit a table format, provide a structured text summary instead.
+5. For each parameter, include:
+   - Parameter name and value WITH unit (in Value column only) — VALUE IS MANDATORY, never leave blank
+   - Normal/reference range WITH unit (in Reference Range column only)
+   - Status — MUST match the pre-classified table if available (Hybrid mode). Otherwise determine by numerical comparison.
+   - Explanation: Write ONE complete sentence using the patient's actual value. EXAMPLE: "Your creatinine of 8.0 mg/dl is significantly elevated, suggesting impaired kidney function." EXAMPLE: "Your sodium of 136 mmol/L is within the normal range." Do NOT write just a medical term name like "High Creatinine Level (Azotemia)" — that is WRONG. Write a proper sentence. No bullet points.
+   - Associated risks: 1-3 words only (e.g., "Kidney Failure", "N/A", "Anemia risk")
+5. After the table/summary, you MUST include these sections in this EXACT order:
+
+Reason Specified
+- This section MUST ALWAYS appear immediately after the parameter table/summary, BEFORE Signature Verification.
+- For EVERY parameter in the report (whether Normal, Low, High, Elevated, or Deficient), provide a clear medical reason explaining WHY it has that status.
+- Format each entry as: "**[Parameter Name] ([Table Status from pre-classified table]):** [Reason]"
+- For Normal values: Explain what it means physiologically that the value is within range. For example: "**Hemoglobin (Normal):** Your hemoglobin level of 14.2 g/dL falls within the healthy range (12-17 g/dL), indicating adequate red blood cell production and oxygen-carrying capacity. This suggests no signs of anemia or polycythemia."
+- For Low/Deficient values: Explain the most likely medical reasons why this value is below normal. For example: "**Vitamin D (Severely Deficient):** Your Vitamin D level of 4.99 ng/mL is far below the normal range (30-100 ng/mL). This is commonly caused by insufficient sun exposure, inadequate dietary intake of Vitamin D-rich foods, malabsorption issues, or living in regions with limited sunlight."
+- For High/Elevated values: Explain the most likely medical reasons why this value is above normal. For example: "**SGOT (Elevated):** Your SGOT level of 205 IU/L significantly exceeds the normal range (5-45 IU/L). Elevated SGOT typically indicates liver cell damage, which can be caused by fatty liver disease, hepatitis, medication side effects, or muscle injury."
+- Do NOT skip any parameter — every single parameter from the table must have a reason listed.
+- Keep explanations patient-friendly and easy to understand.
+
+Signature Verification
+- Look ONLY at the actual text extracted from the report. Search for explicit evidence of a doctor's authorization such as:
+  * A doctor's printed name with credentials (e.g., "Dr. Smith M.D.", "Dr. Sudke M.D. Pathology")
+  * Words like "Authorized Signatory", "Verified by", "Approved by", "Pathologist", "Reporting Doctor"
+  * A designation like "M.D.", "MBBS", "Consultant", "HOD" next to a name
+- If you find such explicit text evidence in the report, state: "An authorized physician's signature is present under the heading '[exact name and designation found in report]'. This indicates the report has been reviewed and approved by a qualified healthcare professional."
+- If NO such text is found anywhere in the report, state: "No authorized physician's signature was found on this report. The report may not have been reviewed by a qualified healthcare professional."
+- IMPORTANT: Do NOT assume or hallucinate a doctor's name. Only report what is actually present in the extracted text. If you cannot find any doctor name or authorization text, the answer is "No authorized signature found."
+- This section MUST appear BEFORE the Overall Assessment & Recommendations section.
+
+Overall Assessment & Recommendations
+- Provide a comprehensive clinical summary followed by actionable recommendations.
+- Each recommendation must start DIRECTLY with its category label followed by a colon, then the details. Do NOT prefix with "Recommendation:" before the category label.
+  CORRECT FORMAT: "- Dietary Modification: Increase intake of foods rich in..."
+  CORRECT FORMAT: "- Specialist Referral: Consider referral to endocrinology..."
+  WRONG FORMAT: "- Recommendation: Dietary Modification: ..." ← Do NOT do this
+  WRONG FORMAT: "- **Recommendation:** Specialist Referral: ..." ← Do NOT do this
+- You may include as many categories as you find clinically relevant — there is no fixed list or limit.
+- List specialist doctor referrals FIRST if applicable.
+- Do NOT mention alcohol, smoking, or tobacco.
+
+After the Overall Assessment & Recommendations, you MUST include the following sections as SEPARATE HEADINGS (using ## markdown heading format). Each section MUST be its own heading — do NOT merge them into Overall Assessment. Include each section ONLY if the report has abnormal findings that make it clinically relevant. If ALL values are normal, you may skip these sections.
+
+## Probable Causes
+- Only include parameters that are having High, Low, Elevated, or Deficient status from the table.
+- For only each abnormal parameter, list the most likely medical causes.
+- Be specific. For example: "Low Hemoglobin may be caused by iron deficiency, chronic blood loss, vitamin B12/folate deficiency, or chronic disease."
+
+## Precautions
+- List practical precautions the patient should take based on the abnormal findings.
+- Include dietary precautions, activity restrictions, and things to avoid.
+- For example: "Avoid high-fat and fried foods due to elevated cholesterol levels."
+
+## Immediate Actions
+- List urgent steps the patient should take RIGHT NOW if any values are critically abnormal.
+- For example: "Seek immediate medical consultation for severely low hemoglobin (below 7 g/dL)."
+- MANDATORY: If ANY parameter has a status of "High", "Low", "Elevated", or "Deficient" (i.e., at least 1 abnormal value), you MUST include this point: "Consult a General Physician for a comprehensive evaluation of your abnormal lab values."
+- If no values are critically abnormal but some values are outside normal range, still include the General Physician consultation point.
+- Only skip this section entirely if ALL values are Normal.
+
+## When to Worry
+- Explain warning signs and symptoms the patient should watch for based on their abnormal results.
+- For example: "If you experience persistent fatigue, dizziness, or shortness of breath, seek medical attention immediately as these may indicate worsening anemia."
+- Help the patient understand when they should escalate to emergency care vs. routine follow-up.
+
+## Recommended Doctor Consultation
+- Suggest which type of doctor(s) the patient should consult based on the findings.
+- ALWAYS include "General Physician" as the first recommendation for an initial evaluation.
+- Then list relevant specialists based on the specific abnormalities found. For example:
+  * Elevated liver enzymes → "Gastroenterologist/Hepatologist"
+  * Abnormal blood sugar → "Endocrinologist/Diabetologist"  
+  * Abnormal kidney function → "Nephrologist"
+  * Abnormal blood counts → "Hematologist"
+  * Abnormal lipid profile → "Cardiologist"
+
+## Follow Up
+- This section MUST ALWAYS be included as the LAST section, regardless of whether values are normal or abnormal.
+- If ALL values in the report are Normal (no abnormal findings):
+  * State: "All your report values are within normal range. Recommended follow-up: Repeat these tests after 6 months as part of routine health monitoring."
+  * Include general advice like maintaining current lifestyle, staying hydrated, and continuing regular checkups.
+- If ANY values are abnormal (High, Low, Elevated, or Deficient):
+  * Provide a specific follow-up timeline guided by the severity of the abnormal findings.
+  * For mildly abnormal values: recommend re-testing in 4-6 weeks after implementing lifestyle changes.
+  * For moderately abnormal values: recommend re-testing in 2-4 weeks and consulting the recommended specialist.
+  * For severely abnormal values: recommend immediate medical consultation and re-testing as directed by the doctor.
+  * List which specific parameters need to be re-tested and when.
+  * Include any monitoring advice (e.g., "Monitor blood sugar levels daily if fasting glucose is elevated").
+
+IMPORTANT FORMATTING RULES FOR THESE 6 SECTIONS:
+1. Each section MUST appear as its own separate ## heading — NOT as bullet points under Overall Assessment.
+2. Each heading must appear EXACTLY ONCE. Do NOT repeat any heading.
+3. Use EXACT heading names: "Probable Causes", "Precautions", "Immediate Actions", "When to Worry", "Recommended Doctor Consultation", "Follow Up". Do NOT use variations like "probable causes" or "Immediate actions" or "follow up" — use the exact capitalization shown.
+4. Put ALL content for a section under its single heading. Do NOT split a section's content across multiple headings.
+5. If a report has ALL normal values, still include "Precautions" (with general health maintenance advice), "Recommended Doctor Consultation" (recommending routine checkup with General Physician), and "Follow Up" (with 6-month routine follow-up). Skip "Probable Causes", "Immediate Actions", and "When to Worry" only if truly not applicable.
+6. "Follow Up" MUST ALWAYS be the LAST section in the analysis — it must appear after "Recommended Doctor Consultation".
+
+Medical Report:
+${report.reportText}
+
+REMINDER: If the HYBRID CLINICAL AI MODE section above contains a pre-classified table, you MUST use those exact statuses. The code has already done the math — do not re-classify any parameter.
+If no pre-classified table was provided, use the fallback classification rules: value < lower = Low, value > upper = High, else Normal.
+
+ADDITIONAL RULES:
+1. The "Value (with Unit)" column must contain ONLY the test result (e.g., "5.6 mg/dl") and the "Reference Range (with Unit)" column must contain ONLY the reference range (e.g., "0.2-1.2 mg/dl"). They must NEVER be merged into one cell.
+2. The table header row (Parameter | Value | Reference Range | Status | Explanation | Risks) must appear ONLY ONCE. Do NOT output it again as a data row.
+3. ONLY include actual LAB TEST PARAMETERS in the table (e.g., Hemoglobin, Creatinine, SGOT, ALP, Bilirubin, etc.). Do NOT include metadata or administrative fields like: Department Name, Patient Details, Patient Name, Age, Gender, Ward Number, Bed Number, Date, Time, Sample Type, Lab Number, Report ID, Hospital, Doctor, Referred By, Specimen, Barcode, Registration, UHID, MR No, OP No, IP No. These are NOT lab parameters and must NEVER appear as rows in the table.
+
+Choose the most appropriate format (table or summary) based on the report content. Always end with the "Overall Assessment & Recommendations" section.`;
+
+      try {
+        // Get or create session
+        const analyzeKey = `${userId}_analyze`;
+        let sessionId = medgemmaSessions.get(analyzeKey);
+
+        if (!sessionId) {
+          const startResponse = await fetch(`${MODEL_BASE_URL}/start_session`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: `report_${id}`,
+              patient_info: `Analyzing medical report for user ${userId}`,
+            }),
+          });
+
+          if (startResponse.ok) {
+            const startData = await startResponse.json();
+            sessionId = startData.session_id || `report_${id}`;
+            if (sessionId) {
+              medgemmaSessions.set(analyzeKey, sessionId);
+            }
+          }
+        }
+
+        const chatResponse = await fetch(`${MODEL_BASE_URL}/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: sessionId || `report_${id}`,
+            message: analysisPrompt,
+            max_tokens: 3000,
+            temperature: 0.3,
+          }),
+        });
+
+        if (!chatResponse.ok) {
+          throw new Error(`Analysis failed: ${chatResponse.status}`);
+        }
+
+        const chatData = await chatResponse.json();
+        let analysisText =
+          chatData.response || chatData.message || chatData.text || "";
+
+        analysisText = analysisText
+          .replace(/```\s*markdown\s*/gi, "")
+          .replace(/```/g, "");
+
+        analysisText = analysisText.replace(/\n*Final Answer:\s*\n*json\s*\n*\{[\s\S]*$/, "").trim();
+
+        analysisText = analysisText.replace(
+          /\|\s*Test Name\s*\|\s*Value\s*\(with Unit\)\s*\|\s*Reference Range\s*\(with Unit\)\s*\|\s*Status\s*\|\s*Explanation\s*\|\s*Risks\s*\|/gi,
+          "",
+        );
+        let headerFound = false;
+        analysisText = analysisText.replace(
+          /\|\s*Parameter\s*\|\s*Value\s*\(with Unit\)\s*\|\s*Reference Range\s*\(with Unit\)\s*\|\s*Status\s*\|\s*Explanation\s*\|\s*Risks\s*\|/gi,
+          (match: string) => {
+            if (!headerFound) {
+              headerFound = true;
+              return match;
+            }
+            return "";
+          },
+        );
+        analysisText = analysisText.replace(/\n{3,}/g, "\n\n");
+
+        analysisText = correctTableStatuses(analysisText);
+        analysisText = filterHallucinatedParams(analysisText, report.reportText || "");
+
+        if (hasClassifiedParams) {
+          analysisText = correctTableStatusesWithClassification(analysisText, classifiedParams);
+          analysisText = deduplicateTableRows(analysisText, classifiedParams);
+          analysisText = correctTextSectionsWithClassification(analysisText, classifiedParams);
+        }
+
+        analysisText = analysisText.replace(/\n*\*?\*?Note\*?\*?\s*:?\s*\*?\s*(?:Since|Because|As)\s+(?:the\s+)?(?:Hybrid|pre[- ]?classified|automatic|code[- ]?based|deterministic)[\s\S]*?(?=\n\n|\nReason\s+Specified|\n##|\n\*\*Reason)/gi, '');
+        analysisText = analysisText.replace(/\n*\*?\*?Note\*?\*?\s*:?\s*\*?\s*(?:I\s+am\s+providing\s+a\s+manual|the\s+automatic\s+classifications?\s+(?:were|was)|the\s+status(?:es)?\s+(?:were|was)\s+(?:incorrect|overridden|changed))[\s\S]*?(?=\n\n|\nReason\s+Specified|\n##|\n\*\*Reason)/gi, '');
+        analysisText = analysisText.replace(/\n{3,}/g, '\n\n');
+
+        // Determine risk level from analysis
+        let riskLevel = "moderate";
+        const lowerAnalysis = analysisText.toLowerCase();
+        if (
+          lowerAnalysis.includes("critical") ||
+          lowerAnalysis.includes("emergency") ||
+          lowerAnalysis.includes("immediate")
+        ) {
+          riskLevel = "critical";
+        } else if (
+          lowerAnalysis.includes("high risk") ||
+          lowerAnalysis.includes("concerning")
+        ) {
+          riskLevel = "high";
+        } else if (
+          lowerAnalysis.includes("normal") &&
+          !lowerAnalysis.includes("abnormal")
+        ) {
+          riskLevel = "low";
+        }
+
+        const savedParams = classifiedParams.map(p => ({
+          name: p.name,
+          value: p.value,
+          unit: p.unit,
+          rangeLow: p.rangeLow,
+          rangeHigh: p.rangeHigh,
+          rawRange: p.rawRange,
+          status: p.status,
+          matchedTier: p.matchedTier,
+        }));
+
+        await storage.updateMedicalReport(id, {
+          analysis: analysisText,
+          riskLevel,
+          parameters: savedParams,
+        });
+
+        res.json({
+          analysis: analysisText,
+          riskLevel,
+          parameters: savedParams,
+        });
+      } catch (fetchError) {
+        console.error("[Reports] AI analysis error:", fetchError);
+
+        let fallbackTable = "";
+        if (classifiedParams.length > 0) {
+          fallbackTable = "\n\n| Parameter | Value (with Unit) | Reference Range (with Unit) | Status | Explanation | Risks |\n|---|---|---|---|---|---|\n";
+          classifiedParams.forEach(p => {
+            const rangeDisplay = p.rawRange === "Not specified" ? "Not specified in report" : p.rawRange;
+            const explanation = p.status === "High" ? `Above normal range.` : p.status === "Low" ? `Below normal range.` : `Within normal limits.`;
+            const risk = p.status === "Normal" ? "N/A" : "Consult your doctor.";
+            fallbackTable += `| ${p.name} | ${p.value} ${p.unit} | ${rangeDisplay} | ${p.status} | ${explanation} | ${risk} |\n`;
+          });
+          fallbackTable += "\nReason Specified\n";
+          classifiedParams.forEach(p => {
+            fallbackTable += `- **${p.name} (${p.status}):** ${p.status === "Normal" ? "Within normal limits." : p.status === "High" ? "Value is above the reference range." : "Value is below the reference range."}\n`;
+          });
+        }
+
+        const fallbackAnalysis = `I was unable to connect to the AI analysis service at this time. 
+Please review your report with a healthcare professional for accurate interpretation.${fallbackTable}
+
+## Follow Up
+Please retry the analysis when the AI service is available for detailed explanations, probable causes, and recommendations.
+For safety, please consult with your doctor for proper analysis.`;
+
+        const fallbackParams = classifiedParams.map(p => ({
+          name: p.name,
+          value: p.value,
+          unit: p.unit,
+          rangeLow: p.rangeLow,
+          rangeHigh: p.rangeHigh,
+          rawRange: p.rawRange,
+          status: p.status,
+          matchedTier: p.matchedTier,
+        }));
+
+        await storage.updateMedicalReport(id, {
+          analysis: fallbackAnalysis,
+          riskLevel: "moderate",
+          parameters: fallbackParams.length > 0 ? fallbackParams : undefined,
+        });
+
+        res.json({
+          analysis: fallbackAnalysis,
+          riskLevel: "moderate",
+          parameters: fallbackParams.length > 0 ? fallbackParams : undefined,
+        });
+      }
+    } catch (err) {
+      console.error("[Reports] Analyze error:", err);
+      res.status(400).json({ message: "Analysis failed" });
+    }
+  });
+
+  app.delete(api.reports.delete.path, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      await storage.deleteMedicalReport(id);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ message: "Failed to delete report" });
+    }
+  });
+
+  // Lightweight PDF text extraction for Diet Planner (no DB storage)
+  app.post("/api/diet/parse-pdf", (req, res, next) => {
+    upload.single("file")(req, res, (err) => {
+      if (err) return res.status(400).json({ message: err.message || "Upload failed" });
+      next();
+    });
+  }, async (req: any, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+      const { mimetype, buffer, originalname } = req.file;
+      let text = "";
+      if (mimetype === "application/pdf" || originalname?.toLowerCase().endsWith(".pdf")) {
+        try {
+          const pdfParser = new PDFParse({ data: new Uint8Array(buffer) });
+          const result = await pdfParser.getText();
+          text = result.text || "";
+          await pdfParser.destroy();
+        } catch (pdfErr) {
+          console.error("[DietPDF] PDF parse failed:", pdfErr);
+          return res.status(500).json({ message: "Failed to extract text from PDF. Please try a different file." });
+        }
+      } else {
+        text = buffer.toString("utf-8");
+      }
+      if (!text.trim()) {
+        return res.status(422).json({ message: "No readable text found in the file. The PDF may be image-based." });
+      }
+
+      // Run the same hybrid deterministic classification used for lab reports
+      const classifiedParams = parseAndClassifyParameters(text);
+      console.log(`[DietPDF] Extracted ${classifiedParams.length} parameters from ${originalname}`);
+
+      // Build a human-readable summary for the AI context
+      const paramSummary = classifiedParams.length > 0
+        ? classifiedParams.map(p =>
+            `${p.name}: ${p.rawValue}${p.unit ? ' ' + p.unit : ''} | Ref: ${p.rawRange} | Status: ${p.status.toUpperCase()}`
+          ).join('\n')
+        : "";
+
+      const truncated = text.slice(0, 6000);
+      res.json({
+        text: truncated,
+        fileName: originalname,
+        params: classifiedParams.map(p => ({
+          name: p.name,
+          value: p.rawValue,
+          unit: p.unit,
+          range: p.rawRange,
+          status: p.status,
+        })),
+        paramSummary,
+      });
+    } catch (err) {
+      console.error("[DietPDF] Unexpected error:", err);
+      res.status(500).json({ message: "Failed to parse PDF" });
+    }
+  });
+
+  // File Upload Endpoint for PDF and other documents
+  app.post(
+    "/api/reports/upload",
+    (req, res, next) => {
+      upload.single("file")(req, res, (err) => {
+        if (err) {
+          if (err.code === "LIMIT_FILE_SIZE") {
+            return res
+              .status(400)
+              .json({ message: "File too large. Maximum size is 10MB." });
+          }
+          return res
+            .status(400)
+            .json({ message: err.message || "File upload failed" });
+        }
+        next();
+      });
+    },
+    async (req, res) => {
+      try {
+        if (!req.file) {
+          return res.status(400).json({ message: "No file uploaded" });
+        }
+
+        // Validate required fields
+        const uploadSchema = z.object({
+          userId: z.string().transform((val) => {
+            const num = parseInt(val);
+            if (isNaN(num)) throw new Error("Invalid user ID");
+            return num;
+          }),
+          reportType: z.string().min(1).default("other"),
+        });
+
+        const validationResult = uploadSchema.safeParse(req.body);
+        if (!validationResult.success) {
+          return res
+            .status(400)
+            .json({ message: "Invalid request: userId is required" });
+        }
+
+        const { userId, reportType } = validationResult.data;
+        const fileName = req.file.originalname;
+
+        let extractedText = "";
+
+        if (req.file.mimetype === "application/pdf") {
+          try {
+            const pdfParser = new PDFParse({
+              data: new Uint8Array(req.file.buffer),
+            });
+            const textResult = await pdfParser.getText();
+            extractedText = textResult.text || "";
+            await pdfParser.destroy();
+          } catch (pdfError) {
+            console.error(
+              "[Upload] PDF text extraction failed, will try OCR:",
+              pdfError,
+            );
+          }
+
+          const trimmedText = extractedText.trim();
+          const alphanumericCount = (trimmedText.match(/[a-zA-Z0-9]/g) || [])
+            .length;
+          const isLikelyGarbage =
+            trimmedText.length > 0 &&
+            alphanumericCount / trimmedText.length < 0.3;
+          const isTooShort = trimmedText.length < 50;
+
+          if (!trimmedText || isTooShort || isLikelyGarbage) {
+            console.log(
+              "[Upload] PDF appears scanned or has poor text extraction, running OCR...",
+            );
+            console.log(
+              `[Upload] Text length: ${trimmedText.length}, alphanumeric ratio: ${trimmedText.length > 0 ? (alphanumericCount / trimmedText.length).toFixed(2) : 0}`,
+            );
+            const ocrText = await ocrFromScannedPdf(req.file.buffer);
+            if (ocrText.trim().length > extractedText.trim().length) {
+              extractedText = ocrText;
+            }
+          }
+        } else if (req.file.mimetype === "text/plain") {
+          extractedText = req.file.buffer.toString("utf-8");
+        } else if (req.file.mimetype.startsWith("image/")) {
+          console.log("[Upload] Image file detected, running OCR...");
+          extractedText = await ocrFromImageBuffer(req.file.buffer);
+        }
+
+        if (!extractedText.trim()) {
+          return res.status(400).json({
+            message:
+              "Could not extract text from the file. The image or document may be too blurry or low quality. Please try a clearer scan or paste the report content manually.",
+          });
+        }
+
+        // Create the report with extracted text
+        const report = await storage.createMedicalReport({
+          userId,
+          reportType,
+          fileName,
+          reportText: extractedText,
+        });
+
+        res.status(201).json(report);
+      } catch (err) {
+        console.error("[Upload] Error:", err);
+        res.status(500).json({ message: "Failed to process uploaded file" });
+      }
+    },
+  );
+
+  app.post("/api/reports/compare", async (req: any, res) => {
+    try {
+      const {
+        userId,
+        previousText,
+        currentText,
+        comparisonType,
+        previousDate,
+        currentDate,
+        previousFileName,
+        currentFileName,
+      } = req.body;
+
+      if (!previousText || !currentText || isNaN(parseInt(userId))) {
+        return res.status(400).json({
+          message: "Previous text, current text and user ID are required",
+        });
+      }
+
+      // Calculate time duration between reports
+      let timeDurationInfo = "";
+      if (previousDate && currentDate) {
+        const prevDate = new Date(previousDate);
+        const currDate = new Date(currentDate);
+        const diffMs = Math.abs(currDate.getTime() - prevDate.getTime());
+        const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+        const diffMonths = Math.floor(diffDays / 30);
+        const diffYears = Math.floor(diffDays / 365);
+
+        let duration = "";
+        if (diffYears > 0) {
+          const remainingMonths = diffMonths - diffYears * 12;
+          duration = `${diffYears} year(s)${remainingMonths > 0 ? ` and ${remainingMonths} month(s)` : ""}`;
+        } else if (diffMonths > 0) {
+          const remainingDays = diffDays - diffMonths * 30;
+          duration = `${diffMonths} month(s)${remainingDays > 0 ? ` and ${remainingDays} day(s)` : ""}`;
+        } else {
+          duration = `${diffDays} day(s)`;
+        }
+
+        const prevDateStr = prevDate.toLocaleDateString("en-US", {
+          year: "numeric",
+          month: "long",
+          day: "numeric",
+        });
+        const currDateStr = currDate.toLocaleDateString("en-US", {
+          year: "numeric",
+          month: "long",
+          day: "numeric",
+        });
+        timeDurationInfo = `\nIMPORTANT TIME CONTEXT:\n- Report 1 Date: ${prevDateStr}${previousFileName ? ` (${previousFileName})` : ""}\n- Report 2 Date: ${currDateStr}${currentFileName ? ` (${currentFileName})` : ""}\n- Time Gap Between Reports: ${duration}\n- Use this time duration to contextualize the rate of change. For example, a significant change over just 1 week is more alarming than the same change over 6 months. Factor this time gap into your assessment of trends, urgency of follow-up, and recommendations.\n`;
+      }
+
+      const MODEL_BASE_URL = "http://43.230.202.219:5000";
+
+      let comparePrompt = "";
+      if (comparisonType === "table") {
+        comparePrompt = `You are a medical AI assistant. Compare these two lab reports for the same patient.
+${timeDurationInfo}
+Report 1 (Previous):
+${previousText}
+
+Report 2 (Current):
+${currentText}
+
+Your response must have exactly this structure — do NOT echo these instructions, do NOT write labels like "Part 1" or "Part 2", just output the content directly:
+
+First, output a markdown table comparing lab parameters with these columns:
+| Parameters | Report 1 Value | Report 2 Value | Change | Significance |
+
+Then after the table, write these two headings with content:
+
+Concerning Trends That Need Medical Attention
+- List any critical values or worrying trends. If referring to a specialist doctor, list that FIRST. If none, say "No concerning trends identified."
+
+Overall Assessment & Recommendations
+- Provide a comprehensive clinical summary and actionable recommendations. Each recommendation must start DIRECTLY with its category label followed by a colon (e.g., "- Dietary Modification: ...", "- Specialist Referral: ..."). Do NOT prefix with "Recommendation:" before the category label. You may include as many categories as you find clinically relevant — there is no fixed list or limit. List specialist doctor referrals FIRST if applicable. Do NOT mention alcohol, smoking, or tobacco. You may present this as one combined heading or as separate "Overall Assessment" and "Recommendations" headings.
+
+Rules:
+- ONLY include actual lab test parameters in the table (e.g., Hemoglobin, WBC, Platelet, Vitamin D, Cholesterol, etc.)
+- Do NOT include Patient Name, Patient ID, Age, Sex, Ward No, Bed No, Department, Hospital Name, Doctor Name, Date, Sample Type, or any non-test metadata in the table
+- Include UNITS with all values (e.g., "12.5 g/dL", "7500 /uL")
+- If a parameter hasn't changed, list "None" in Change and "Stable" in Significance
+- If a parameter is only in one report, list "NA" for the missing value
+- Do NOT repeat or echo these instructions in your response`;
+      } else {
+        comparePrompt = `You are a medical AI assistant. Compare these two lab reports for the same patient and provide a structured analysis.
+${timeDurationInfo}
+Report 1 (Previous/Older):
+${previousText}
+
+Report 2 (Current/Newer):
+${currentText}
+
+You MUST provide the analysis using ALL of these headings, in this EXACT order. Do NOT skip any heading. Every heading MUST appear in your response:
+
+Significant Increments and Significant Decrements
+(List ALL parameters that changed between Report 1 and Report 2 under this single combined heading. For each parameter, clearly state whether it INCREASED or DECREASED. An increment means Report 2 value > Report 1 value. A decrement means Report 2 value < Report 1 value. Double-check the math. If no parameters changed, write "None noted.")
+
+Improvements or Deteriorations in Health Status
+(Provide a concise summary of the overall health trend based on the changes observed)
+
+Concerning Trends That Need Medical Attention
+(Highlight critical issues and recommended next steps. If none, say "No concerning trends identified.")
+
+Overall Assessment & Recommendations
+(Provide a comprehensive clinical summary and actionable recommendations. Each recommendation must start DIRECTLY with its category label followed by a colon (e.g., "- Dietary Modification: ...", "- Specialist Referral: ..."). Do NOT prefix with "Recommendation:" before the category label. You may include as many categories as you find clinically relevant — there is no fixed list or limit. List specialist doctor referrals FIRST if applicable. Do NOT mention alcohol, smoking, or tobacco. You may present this as one combined heading or as separate "Overall Assessment" and "Recommendations" headings.)
+
+CRITICAL INSTRUCTIONS:
+1. Use the EXACT headings above. No colons after headings, no numbering, no extra formatting.
+2. CAREFULLY COMPARE the numeric values: if Report 2 value > Report 1 value, it is an INCREMENT. If Report 2 value < Report 1 value, it is a DECREMENT. Double-check your math before categorizing.
+3. Use the format: "- Parameter name (INCREASED/DECREASED): [Report 1 Value] → [Report 2 Value] (Unit) — brief clinical note"
+4. ALL FOUR headings must appear in your response. Never omit any section.
+5. The "Overall Assessment & Recommendations" section must have labeled categories (e.g., "Specialist Referral:", "Dietary Modification:", "Lifestyle Changes:", "Follow-Up Testing:") plus any other relevant categories the findings suggest.
+6. Do NOT use markdown tables. Use plain text with bullet points only.
+7. Do NOT use separate "Significant Increments" and "Significant Decrements" headings. Use ONLY the combined heading "Significant Increments and Significant Decrements".
+8. Do NOT split "Overall Assessment & Recommendations" into separate "Analysis" and "Recommendations" headings.`;
+      }
+
+      const compareSessionId = `compare_${userId}_${Date.now()}`;
+      const startResponse = await fetch(`${MODEL_BASE_URL}/start_session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: compareSessionId,
+          patient_info: `Comparing medical lab reports for user ${userId}. You are a medical AI assistant specialized in comparing lab reports.`,
+        }),
+      });
+      let sessionId = compareSessionId;
+      if (startResponse.ok) {
+        const startData = await startResponse.json();
+        sessionId = startData.session_id || compareSessionId;
+      }
+
+      const chatResponse = await fetch(`${MODEL_BASE_URL}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionId,
+          message: comparePrompt,
+          max_tokens: 1500,
+          temperature: 0.3,
+        }),
+      });
+
+      if (!chatResponse.ok) throw new Error("Comparison failed");
+      const chatData = await chatResponse.json();
+      let comparisonText =
+        chatData.response || chatData.message || chatData.text || "";
+      comparisonText = comparisonText
+        .replace(/PART\s*\d+\s*[-:].*/gi, "")
+        .replace(/CRITICAL INSTRUCTIONS:[\s\S]*$/i, "")
+        .replace(/Rules:[\s\S]*?(?=\n[A-Z]|\n\n|$)/i, "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+      comparisonText = correctTableStatuses(comparisonText);
+      res.json({ comparison: comparisonText });
+    } catch (err) {
+      console.error("[Comparison] Error:", err);
+      res.status(500).json({ message: "Failed to compare reports" });
+    }
+  });
+
+  return httpServer;
+}
